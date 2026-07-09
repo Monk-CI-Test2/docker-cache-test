@@ -32,15 +32,23 @@ on:
         description: "Optional Docker build target (empty = final image)"
         default: ""
         type: string
-      runner_label:
-        description: "MonkCI runner label / pool"
+      writer_runner:
+        description: "Runner for the COLD writer (heavy full build - needs CPU/RAM)"
+        default: "monkci-ubuntu-24.04-32"
+        type: choice
+        options:
+          - "monkci-ubuntu-24.04-32"
+          - "monkci-ubuntu-24.04-16"
+          - "monkci-ubuntu-24.04-8"
+          - "monkci-ubuntu-24.04-4"
+      reader_runner:
+        description: "Runner for the 20 parallel clone jobs (cache hits are light)"
         default: "monkci-ubuntu-24.04-4"
         type: choice
         options:
           - "monkci-ubuntu-24.04-4"
           - "monkci-ubuntu-24.04-2"
-          - "monkci-ubuntu-24.04-32"
-          - "monkci-ubuntu-latest"
+          - "monkci-ubuntu-24.04-8"
       warmup:
         description: "Run the cold writer first to publish the snapshot"
         default: true
@@ -57,7 +65,7 @@ jobs:
   warmup:
     name: warmup-writer
     if: ${{ inputs.warmup }}
-    runs-on: ${{ inputs.runner_label }}
+    runs-on: ${{ inputs.writer_runner }}
     timeout-minutes: 180
     steps:
       - name: Fetch PostHog source
@@ -152,7 +160,7 @@ jobs:
     name: cache-job-${{ matrix.job }}
     needs: warmup
     if: ${{ !cancelled() && (needs.warmup.result == 'success' || needs.warmup.result == 'skipped') }}
-    runs-on: ${{ inputs.runner_label }}
+    runs-on: ${{ inputs.reader_runner }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -248,7 +256,7 @@ jobs:
     needs: [warmup, fanout]
     # !cancelled() (not always()) so a run cancellation also cancels/skips this job.
     if: ${{ !cancelled() }}
-    runs-on: ${{ inputs.runner_label }}
+    runs-on: ${{ inputs.reader_runner }}
     timeout-minutes: 10
     steps:
       - name: Download all results
