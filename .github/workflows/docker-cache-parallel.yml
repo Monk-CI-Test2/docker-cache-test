@@ -46,9 +46,9 @@ on:
         default: true
         type: boolean
 
-concurrency:
-  group: posthog-docker-cache-20x-${{ github.ref }}
-  cancel-in-progress: true  # a re-trigger cancels the previous run instead of queueing behind it
+# No `concurrency` group on purpose: this is a manually-triggered test workflow and
+# a wedged/queued run must never block you from starting a fresh one. Each dispatch
+# runs independently; just cancel any run you don't want.
 
 permissions:
   contents: read
