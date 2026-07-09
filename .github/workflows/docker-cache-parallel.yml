@@ -80,7 +80,7 @@ jobs:
         with:
           nofallback: 'true'  # fail loudly if the cache acquire fails (this is a cache test)
       - name: Mark cache-setup end
-        if: always()
+        if: ${{ !cancelled() }}
         run: date +%s%3N > /tmp/t_setup_end
       - name: Build PostHog (canonical writer)
         id: build
@@ -102,7 +102,7 @@ jobs:
             --output type=cacheonly posthog 2>&1 | tee /tmp/build.log
           date +%s%3N > /tmp/t_build_end
       - name: Record result
-        if: always()
+        if: ${{ !cancelled() }}
         shell: bash
         env:
           ROLE: writer
@@ -140,7 +140,7 @@ jobs:
             echo "cache_fs_size_bytes=${FS_SIZE:-}"; echo "cache_fs_used_bytes=${FS_USED:-}"
           } | tee "/tmp/results/result-$ROLE-$JOB_ID.env"
       - name: Upload result
-        if: always()
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: result-writer-warmup
@@ -151,7 +151,7 @@ jobs:
   fanout:
     name: cache-job-${{ matrix.job }}
     needs: warmup
-    if: ${{ always() && (needs.warmup.result == 'success' || needs.warmup.result == 'skipped') }}
+    if: ${{ !cancelled() && (needs.warmup.result == 'success' || needs.warmup.result == 'skipped') }}
     runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 120
     strategy:
@@ -180,7 +180,7 @@ jobs:
         with:
           nofallback: 'true'
       - name: Mark cache-setup end
-        if: always()
+        if: ${{ !cancelled() }}
         run: date +%s%3N > /tmp/t_setup_end
       - name: Build PostHog (disposable clone)
         id: build
@@ -202,7 +202,7 @@ jobs:
             --output type=cacheonly posthog 2>&1 | tee /tmp/build.log
           date +%s%3N > /tmp/t_build_end
       - name: Record result
-        if: always()
+        if: ${{ !cancelled() }}
         shell: bash
         env:
           ROLE: reader
@@ -235,7 +235,7 @@ jobs:
             echo "cache_fs_size_bytes=${FS_SIZE:-}"; echo "cache_fs_used_bytes=${FS_USED:-}"
           } | tee "/tmp/results/result-$ROLE-$JOB_ID.env"
       - name: Upload result
-        if: always()
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: result-reader-${{ matrix.job }}
@@ -246,7 +246,8 @@ jobs:
   report:
     name: cache-report
     needs: [warmup, fanout]
-    if: ${{ always() }}
+    # !cancelled() (not always()) so a run cancellation also cancels/skips this job.
+    if: ${{ !cancelled() }}
     runs-on: ${{ inputs.runner_label }}
     timeout-minutes: 10
     steps:
