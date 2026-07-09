@@ -1,0 +1,318 @@
+name: PostHog Docker Cache - 20x Parallel
+
+# Concurrency test for the Ceph RBD docker cache using the (large) PostHog build.
+#
+#   1. warmup-writer : one canonical writer builds PostHog COLD, then on release
+#                      publishes the protected last-good cache snapshot.
+#   2. fanout (20x)  : 20 jobs build the SAME PostHog ref in parallel; each is
+#                      handed a disposable COW clone of that snapshot -> should be
+#                      mostly CACHED and much faster than the cold writer.
+#   3. report        : aggregates every job into the run summary (timings +
+#                      per-process cache overhead + cache size).
+#
+# Per-process metrics captured (see the run summary table):
+#   * cache_setup_sec  - duration of "Set up Docker builder" = acquire + map +
+#                        mount + (readers) COW clone creation. This is the
+#                        per-process overhead of getting a snapshot/clone.
+#   * build_sec        - the docker build itself (cache-hit builds are tiny).
+#   * cached_steps     - CACHED build steps served from the clone.
+#   * cache_fs_used    - `df` on the mounted cache = data the job saw (filesystem
+#                        view; the true RBD/snapshot byte size needs Ceph admin
+#                        and is not visible to a job, so this is the closest
+#                        in-workflow proxy).
+
+on:
+  workflow_dispatch:
+    inputs:
+      posthog_ref:
+        description: "PostHog git ref/SHA (identical across jobs so the cache is shared)"
+        default: "05dbbbf21b24a01af49677bd5a4b6df2d1ed3002"
+        type: string
+      build_target:
+        description: "Optional Docker build target (empty = final image)"
+        default: ""
+        type: string
+      runner_label:
+        description: "MonkCI runner label / pool"
+        default: "monkci-ubuntu-24.04-4"
+        type: choice
+        options:
+          - "monkci-ubuntu-24.04-4"
+          - "monkci-ubuntu-24.04-2"
+          - "monkci-ubuntu-24.04-32"
+          - "monkci-ubuntu-latest"
+      warmup:
+        description: "Run the cold writer first to publish the snapshot"
+        default: true
+        type: boolean
+
+concurrency:
+  group: posthog-docker-cache-20x-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  warmup:
+    name: warmup-writer
+    if: ${{ inputs.warmup }}
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 180
+    steps:
+      - name: Fetch PostHog source
+        shell: bash
+        env:
+          POSTHOG_REF: ${{ inputs.posthog_ref }}
+        run: |
+          set -euo pipefail
+          rm -rf posthog && mkdir posthog && cd posthog
+          git init -q
+          git remote add origin https://github.com/PostHog/posthog.git
+          git fetch -q --depth 1 origin "$POSTHOG_REF"
+          git checkout -q FETCH_HEAD
+          git rev-parse HEAD | tee /tmp/posthog_sha
+      - name: Mark cache-setup start
+        run: date +%s%3N > /tmp/t_setup_start
+      - name: Set up Docker builder
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'  # fail loudly if the cache acquire fails (this is a cache test)
+      - name: Mark cache-setup end
+        if: always()
+        run: date +%s%3N > /tmp/t_setup_end
+      - name: Build PostHog (canonical writer)
+        id: build
+        shell: bash
+        env:
+          BUILD_TARGET: ${{ inputs.build_target }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${MONKCI_BUILDER:-}" ]]; then
+            echo "::error title=docker-cache::MONKCI_BUILDER not set - cache acquire failed"; exit 1
+          fi
+          target_args=(); [[ -n "$BUILD_TARGET" ]] && target_args+=(--target "$BUILD_TARGET")
+          date +%s%3N > /tmp/t_build_start
+          docker buildx build --builder "$MONKCI_BUILDER" \
+            --progress=plain \
+            --build-arg "COMMIT_HASH=$(cat /tmp/posthog_sha)" \
+            -f posthog/Dockerfile \
+            "${target_args[@]}" \
+            --output type=cacheonly posthog 2>&1 | tee /tmp/build.log
+          date +%s%3N > /tmp/t_build_end
+      - name: Record result
+        if: always()
+        shell: bash
+        env:
+          ROLE: writer
+          JOB_ID: warmup
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          SETUP_OUTCOME: ${{ steps.builder.outcome }}
+          CACHE_HIT: ${{ steps.builder.outputs.cache-hit }}
+          MOUNT_PATH: ${{ steps.builder.outputs.mount-path }}
+        run: |
+          bash "$GITHUB_WORKSPACE/.ci/record.sh" 2>/dev/null || {
+            # record.sh may not exist (repo has no checkout); inline fallback below
+            :
+          }
+          # ---- inline recorder (no repo checkout in this job) ----
+          set -uo pipefail
+          ms() { cat "$1" 2>/dev/null || echo 0; }
+          SU_S=$(ms /tmp/t_setup_start); SU_E=$(ms /tmp/t_setup_end)
+          B_S=$(ms /tmp/t_build_start); B_E=$(ms /tmp/t_build_end)
+          setup_sec=$(awk -v a="$SU_S" -v b="$SU_E" 'BEGIN{ if(a>0&&b>=a) printf "%.1f",(b-a)/1000; else print "-" }')
+          build_sec=$(awk -v a="$B_S" -v b="$B_E" 'BEGIN{ if(a>0&&b>=a) printf "%.1f",(b-a)/1000; else print "-" }')
+          CACHED=$(grep -Eic '\bCACHED\b' /tmp/build.log 2>/dev/null || echo 0)
+          TOTAL=$(grep -Eoc '^#[0-9]+ ' /tmp/build.log 2>/dev/null || echo 0)
+          GOT_CACHE=$([[ -n "${MONKCI_BUILDER:-}" ]] && echo true || echo false)
+          FS_SIZE=""; FS_USED=""
+          if [[ -n "${MOUNT_PATH:-}" ]] && df -B1 "$MOUNT_PATH" >/dev/null 2>&1; then
+            read -r FS_SIZE FS_USED < <(df -B1 --output=size,used "$MOUNT_PATH" | tail -1 | awk '{print $1,$2}')
+          fi
+          mkdir -p /tmp/results
+          {
+            echo "role=$ROLE"; echo "job=$JOB_ID"
+            echo "setup_outcome=${SETUP_OUTCOME:-unknown}"; echo "build_outcome=${BUILD_OUTCOME:-unknown}"
+            echo "got_cache=$GOT_CACHE"; echo "cache_hit=${CACHE_HIT:-}"
+            echo "cache_setup_sec=$setup_sec"; echo "build_sec=$build_sec"
+            echo "cached_steps=$CACHED"; echo "total_steps=$TOTAL"
+            echo "cache_fs_size_bytes=${FS_SIZE:-}"; echo "cache_fs_used_bytes=${FS_USED:-}"
+          } | tee "/tmp/results/result-$ROLE-$JOB_ID.env"
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-writer-warmup
+          path: /tmp/results/
+          if-no-files-found: warn
+          retention-days: 7
+
+  fanout:
+    name: cache-job-${{ matrix.job }}
+    needs: warmup
+    if: ${{ always() && (needs.warmup.result == 'success' || needs.warmup.result == 'skipped') }}
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        job: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    steps:
+      - name: Fetch PostHog source
+        shell: bash
+        env:
+          POSTHOG_REF: ${{ inputs.posthog_ref }}
+        run: |
+          set -euo pipefail
+          rm -rf posthog && mkdir posthog && cd posthog
+          git init -q
+          git remote add origin https://github.com/PostHog/posthog.git
+          git fetch -q --depth 1 origin "$POSTHOG_REF"
+          git checkout -q FETCH_HEAD
+          git rev-parse HEAD | tee /tmp/posthog_sha
+      - name: Mark cache-setup start
+        run: date +%s%3N > /tmp/t_setup_start
+      - name: Set up Docker builder
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Mark cache-setup end
+        if: always()
+        run: date +%s%3N > /tmp/t_setup_end
+      - name: Build PostHog (disposable clone)
+        id: build
+        shell: bash
+        env:
+          BUILD_TARGET: ${{ inputs.build_target }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${MONKCI_BUILDER:-}" ]]; then
+            echo "::error title=docker-cache::MONKCI_BUILDER not set - cache acquire failed"; exit 1
+          fi
+          target_args=(); [[ -n "$BUILD_TARGET" ]] && target_args+=(--target "$BUILD_TARGET")
+          date +%s%3N > /tmp/t_build_start
+          docker buildx build --builder "$MONKCI_BUILDER" \
+            --progress=plain \
+            --build-arg "COMMIT_HASH=$(cat /tmp/posthog_sha)" \
+            -f posthog/Dockerfile \
+            "${target_args[@]}" \
+            --output type=cacheonly posthog 2>&1 | tee /tmp/build.log
+          date +%s%3N > /tmp/t_build_end
+      - name: Record result
+        if: always()
+        shell: bash
+        env:
+          ROLE: reader
+          JOB_ID: ${{ matrix.job }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          SETUP_OUTCOME: ${{ steps.builder.outcome }}
+          CACHE_HIT: ${{ steps.builder.outputs.cache-hit }}
+          MOUNT_PATH: ${{ steps.builder.outputs.mount-path }}
+        run: |
+          set -uo pipefail
+          ms() { cat "$1" 2>/dev/null || echo 0; }
+          SU_S=$(ms /tmp/t_setup_start); SU_E=$(ms /tmp/t_setup_end)
+          B_S=$(ms /tmp/t_build_start); B_E=$(ms /tmp/t_build_end)
+          setup_sec=$(awk -v a="$SU_S" -v b="$SU_E" 'BEGIN{ if(a>0&&b>=a) printf "%.1f",(b-a)/1000; else print "-" }')
+          build_sec=$(awk -v a="$B_S" -v b="$B_E" 'BEGIN{ if(a>0&&b>=a) printf "%.1f",(b-a)/1000; else print "-" }')
+          CACHED=$(grep -Eic '\bCACHED\b' /tmp/build.log 2>/dev/null || echo 0)
+          TOTAL=$(grep -Eoc '^#[0-9]+ ' /tmp/build.log 2>/dev/null || echo 0)
+          GOT_CACHE=$([[ -n "${MONKCI_BUILDER:-}" ]] && echo true || echo false)
+          FS_SIZE=""; FS_USED=""
+          if [[ -n "${MOUNT_PATH:-}" ]] && df -B1 "$MOUNT_PATH" >/dev/null 2>&1; then
+            read -r FS_SIZE FS_USED < <(df -B1 --output=size,used "$MOUNT_PATH" | tail -1 | awk '{print $1,$2}')
+          fi
+          mkdir -p /tmp/results
+          {
+            echo "role=$ROLE"; echo "job=$JOB_ID"
+            echo "setup_outcome=${SETUP_OUTCOME:-unknown}"; echo "build_outcome=${BUILD_OUTCOME:-unknown}"
+            echo "got_cache=$GOT_CACHE"; echo "cache_hit=${CACHE_HIT:-}"
+            echo "cache_setup_sec=$setup_sec"; echo "build_sec=$build_sec"
+            echo "cached_steps=$CACHED"; echo "total_steps=$TOTAL"
+            echo "cache_fs_size_bytes=${FS_SIZE:-}"; echo "cache_fs_used_bytes=${FS_USED:-}"
+          } | tee "/tmp/results/result-$ROLE-$JOB_ID.env"
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-reader-${{ matrix.job }}
+          path: /tmp/results/
+          if-no-files-found: warn
+          retention-days: 7
+
+  report:
+    name: cache-report
+    needs: [warmup, fanout]
+    if: ${{ always() }}
+    runs-on: ${{ inputs.runner_label }}
+    timeout-minutes: 10
+    steps:
+      - name: Download all results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          path: results
+          merge-multiple: true
+      - name: Render run summary
+        shell: bash
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          files=(results/result-*.env)
+          {
+            echo "## PostHog docker-cache 20x parallel report"
+            echo ""
+            echo "| job | role | got cache | cache hit | build | cache_setup (s) | build (s) | cached steps | cache FS used |"
+            echo "|---|---|---|---|---|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          total=0; with_cache=0; hits=0
+          rc=0; rsum=0; rmin=999999; rmax=0
+          scount=0; ssum=0
+          fs_sum=0; fs_count=0; w_build="-"; w_setup="-"
+          for f in "${files[@]}"; do
+            role=""; job=""; got_cache=""; cache_hit=""; build_outcome=""
+            cache_setup_sec=""; build_sec=""; cached_steps=""; cache_fs_used_bytes=""
+            source "$f"
+            total=$((total+1))
+            [[ "$got_cache" == "true" ]] && with_cache=$((with_cache+1))
+            [[ "$cache_hit" == "true" ]] && hits=$((hits+1))
+            fs_h="-"
+            if [[ -n "${cache_fs_used_bytes:-}" ]]; then
+              fs_h=$(numfmt --to=iec --suffix=B "$cache_fs_used_bytes" 2>/dev/null || echo "$cache_fs_used_bytes")
+              fs_sum=$((fs_sum + cache_fs_used_bytes)); fs_count=$((fs_count+1))
+            fi
+            # accumulate setup overhead across all jobs (integer seconds for awk-free avg)
+            si=${cache_setup_sec%.*}; [[ "$si" =~ ^[0-9]+$ ]] && { ssum=$((ssum+si)); scount=$((scount+1)); }
+            if [[ "$role" == "reader" ]]; then
+              bi=${build_sec%.*}
+              if [[ "$bi" =~ ^[0-9]+$ ]]; then
+                rc=$((rc+1)); rsum=$((rsum+bi))
+                (( bi < rmin )) && rmin=$bi; (( bi > rmax )) && rmax=$bi
+              fi
+            fi
+            [[ "$role" == "writer" ]] && { w_build="$build_sec"; w_setup="$cache_setup_sec"; }
+            echo "| $job | $role | $got_cache | ${cache_hit:--} | $build_outcome | $cache_setup_sec | $build_sec | $cached_steps | $fs_h |" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+          avg_rb="-"; [[ $rc -gt 0 ]] && avg_rb=$((rsum/rc))
+          avg_s="-"; [[ $scount -gt 0 ]] && avg_s=$((ssum/scount))
+          avg_fs="-"; [[ $fs_count -gt 0 ]] && avg_fs=$(numfmt --to=iec --suffix=B $((fs_sum/fs_count)) 2>/dev/null || echo $((fs_sum/fs_count)))
+          {
+            echo ""
+            echo "### Aggregates"
+            echo ""
+            echo "| metric | value |"
+            echo "|---|---|"
+            echo "| jobs reporting | $total |"
+            echo "| jobs with cache builder | $with_cache / $total |"
+            echo "| jobs with cache HIT (served snapshot/clone) | $hits |"
+            echo "| writer (cold): cache_setup / build | ${w_setup}s / ${w_build}s |"
+            echo "| reader build sec avg / min / max | ${avg_rb}s / ${rmin}s / ${rmax}s |"
+            echo "| **avg cache_setup overhead (acquire+map+mount+clone)** | **${avg_s}s** |"
+            echo "| avg cache FS used (~payload the job saw) | $avg_fs |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Report written to run summary."
