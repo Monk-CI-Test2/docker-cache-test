@@ -146,14 +146,14 @@ jobs:
             echo "cache_fs_size_bytes=${FS_SIZE:-}"; echo "cache_fs_used_bytes=${FS_USED:-}"
           } | tee "/tmp/results/result-$ROLE-$JOB_ID.env"
 
-      - name: Upload result
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: result-realworld-${{ matrix.job }}
-          path: /tmp/results/
-          if-no-files-found: warn
-          retention-days: 7
+      # - name: Upload result
+      #   if: ${{ !cancelled() }}
+      #   uses: actions/upload-artifact@v4
+      #   with:
+      #     name: result-realworld-${{ matrix.job }}
+      #     path: /tmp/results/
+      #     if-no-files-found: warn
+      #     retention-days: 7
 
   report:
     name: realworld-report
