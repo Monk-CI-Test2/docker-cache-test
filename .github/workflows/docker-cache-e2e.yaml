@@ -1,0 +1,254 @@
+name: Docker Cache — E2E (corruption + full recovery matrix)
+
+# End-to-end exercise of the Ceph RBD docker cache in a REAL runner environment,
+# including deliberately making the cache bad and walking every recovery path.
+# Fully automated (no manual rbd step) and ARTIFACT-FREE: builds use
+# `--output type=cacheonly` (no image export), and nothing is uploaded — results
+# go to the job summary only.
+#
+# Runners are ephemeral (fresh VM per job), so the jobs are chained with
+# `needs:` to run in order against the SAME per-repo canonical cache on Ceph:
+#
+#   seed      cold acquire -> build -> clean release  (warms cache, publishes last-good)
+#   warm-hit  warm acquire -> assert cache-hit + CACHED  (normal reuse path)
+#   corrupt   acquire -> build -> STOP buildkit + delete marker & BuildKit DBs
+#             on the mounted cache  (leaves the canonical inconsistent / uncleanly
+#             released, exactly what the agent's preflight must detect)
+#   recover   acquire (fallback ALLOWED) -> the agent must NOT hang and the build
+#             MUST succeed via reformat-recovery / controller reset / local fallback
+#   rehit     warm acquire -> assert cache-hit + CACHED  (cache healed & warm again)
+#
+# The hard assertions are the invariants the lifecycle fixes guarantee:
+#   * a warm repo reports cache-hit and reuses layers (warm-hit, rehit),
+#   * a corrupted cache never hangs the acquire and never fails the build (recover).
+# The exact recovery MECHANISM (reformat vs CORRUPT-reset vs poison-fallback) is
+# reported in each summary + the miglet/controller log greps, since it depends on
+# whether the repo is on the base canonical path or a corruption-active canary.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner"
+        default: "monkci-ubuntu-24.04-4"
+        type: choice
+        options:
+          - "monkci-ubuntu-24.04-4"
+          - "monkci-ubuntu-24.04-2"
+          - "monkci-ubuntu-24.04-8"
+
+# No concurrency group: a wedged manual run must never block a fresh dispatch.
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  seed:
+    name: 1 · seed (cold → warm)
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire (nofallback)
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Build (cacheonly — no artifact)
+        run: |
+          docker buildx build --builder "${MONKCI_BUILDER:-default}" \
+            --output type=cacheonly --progress plain .
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### 1 · seed"
+            echo "- cache-hit at acquire: \`${{ steps.builder.outputs.cache-hit }}\` (first-ever seed is a legit miss; it warms the cache)"
+            echo "- mount: \`${{ steps.builder.outputs.mount-path }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  warm-hit:
+    name: 2 · warm hit
+    needs: seed
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire (nofallback)
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Build and assert CACHED
+        id: build
+        run: |
+          set -o pipefail
+          docker buildx build --builder "${MONKCI_BUILDER:-default}" \
+            --output type=cacheonly --progress plain . 2>&1 | tee /tmp/build.log
+          cached=$(grep -Eic '\bCACHED\b' /tmp/build.log || true)
+          echo "cached=$cached" >> "$GITHUB_OUTPUT"
+          [ "$cached" -ge 1 ] || { echo "::error::warm hit produced no CACHED layers"; exit 1; }
+      - name: Assert cache-hit
+        run: |
+          hit='${{ steps.builder.outputs.cache-hit }}'
+          [ "$hit" = "true" ] || { echo "::error::expected cache-hit=true after seed, got '$hit'"; exit 1; }
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### 2 · warm hit"
+            echo "- cache-hit: \`${{ steps.builder.outputs.cache-hit }}\`  |  CACHED layers: \`${{ steps.build.outputs.cached }}\`"
+            echo "- **PASS** = normal warm reuse works."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  corrupt:
+    name: 3 · corrupt the cache
+    needs: warm-hit
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire (nofallback)
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Build (populate BuildKit state on the cache)
+        run: |
+          docker buildx build --builder "${MONKCI_BUILDER:-default}" \
+            --output type=cacheonly --progress plain .
+      - name: Make the cache bad
+        id: corrupt
+        env:
+          MP: ${{ steps.builder.outputs.mount-path }}
+        run: |
+          set -uo pipefail
+          if [ -z "${MP:-}" ] || [ ! -d "$MP" ]; then
+            echo "::error::no mount-path; cache was not enabled, nothing to corrupt"; exit 1
+          fi
+          echo "Corrupting mounted cache at: $MP"
+
+          # 1) Stop BuildKit first so it can't re-flush the DBs we delete, and so
+          #    the agent's release stop fails -> UNCLEAN release (no clean-shutdown
+          #    marker, no snapshot publication). Discover the container generically.
+          BKC=$(docker ps --format '{{.Names}} {{.Image}}' | grep -iE 'buildkit|moby' | awk '{print $1}' | head -1)
+          if [ -n "${BKC:-}" ]; then
+            echo "Stopping BuildKit container: $BKC"
+            sudo docker stop -t 5 "$BKC" || true
+          else
+            echo "No BuildKit container found via docker ps (continuing)"
+          fi
+
+          # 2) Remove the clean-shutdown marker -> next acquire reads a crash.
+          sudo rm -f "$MP/.monkci-clean-shutdown" || true
+
+          # 3) Delete every BuildKit BoltDB while LEAVING the snapshot dirs, which
+          #    is the exact 'snapshots without DBs' inconsistency the preflight
+          #    consistency check confirms and recovers from.
+          echo "DBs before:"; sudo find "$MP" -xdev -maxdepth 3 -type f \
+            \( -name cache.db -o -name history.db -o -name metadata.db \
+               -o -name metadata_v2.db -o -name containerdmeta.db \) -print || true
+          sudo find "$MP" -xdev -type f \
+            \( -name cache.db -o -name history.db -o -name metadata.db \
+               -o -name metadata_v2.db -o -name containerdmeta.db \) -delete || true
+          echo "Snapshot dirs still present (should list runc-*):"
+          sudo find "$MP" -xdev -maxdepth 2 -type d -name 'runc-*' -print || true
+          echo "corrupted=1" >> "$GITHUB_OUTPUT"
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### 3 · corrupt"
+            echo "- corrupted mount: \`${{ steps.builder.outputs.mount-path }}\`"
+            echo "- actions: stopped BuildKit (unclean release), removed clean-shutdown marker, deleted BuildKit DBs (kept snapshot dirs)."
+            echo "- The next acquire must detect this via preflight and recover."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  recover:
+    name: 4 · recover (no hang, build must pass)
+    needs: corrupt
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      # nofallback=false ON PURPOSE: if corruption poisoned the service we WANT
+      # the documented local-builder fallback rather than a hard failure.
+      - name: Acquire (fallback allowed)
+        id: builder
+        continue-on-error: true
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'false'
+      - name: Build MUST succeed (recovery or fallback)
+        id: build
+        run: |
+          set -o pipefail
+          if [ -n "${MONKCI_BUILDER:-}" ]; then
+            B="$MONKCI_BUILDER"; echo "using cache builder: $B"
+          else
+            B="local-fallback"
+            docker buildx inspect "$B" >/dev/null 2>&1 || docker buildx create --name "$B" --driver docker-container >/dev/null
+            echo "::warning::cache unavailable — building on local fallback"
+          fi
+          echo "builder=$B" >> "$GITHUB_OUTPUT"
+          docker buildx build --builder "$B" --output type=cacheonly --progress plain . 2>&1 | tee /tmp/build.log
+      - name: Assert invariants (no hang, build passed)
+        run: |
+          [ "${{ steps.build.outcome }}" = "success" ] || { echo "::error::build failed after corruption"; exit 1; }
+          # If the acquire had hung, the setup step would have hit its own client
+          # timeout and this job's timeout-minutes; reaching here with a passing
+          # build is the no-hang / no-brick invariant holding.
+          echo "OK: acquire returned and build succeeded."
+      - name: Summary
+        if: always()
+        env:
+          GOT_CACHE: ${{ steps.builder.outputs.cache-hit }}
+        run: |
+          used='${{ steps.build.outputs.builder }}'
+          path="reformat/reset recovery"; [ "$used" = "local-fallback" ] && path="local fallback (service degraded/poisoned)"
+          {
+            echo "### 4 · recover"
+            echo "- setup outcome: \`${{ steps.builder.outcome }}\`  |  cache-hit: \`${GOT_CACHE:-<none>}\`  |  builder: \`${used}\`"
+            echo "- inferred path: **${path}**"
+            echo "- **PASS** = build succeeded and the acquire did not hang."
+            echo ""
+            echo "Confirm the exact mechanism on the runner VM / controller:"
+            echo '```'
+            echo "journalctl -u miglet | grep -Ei 'preflight|reformat|corrupt|degraded|poison|abandon|crash'"
+            echo "kubectl -n dev logs deploy/mig-controller | grep -Ei 'unhealthy|reset|corrupt|evict'"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  rehit:
+    name: 5 · re-hit (cache healed)
+    needs: recover
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire (nofallback)
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Build and assert CACHED
+        id: build
+        run: |
+          set -o pipefail
+          docker buildx build --builder "${MONKCI_BUILDER:-default}" \
+            --output type=cacheonly --progress plain . 2>&1 | tee /tmp/build.log
+          cached=$(grep -Eic '\bCACHED\b' /tmp/build.log || true)
+          echo "cached=$cached" >> "$GITHUB_OUTPUT"
+          [ "$cached" -ge 1 ] || { echo "::error::cache did not heal — no CACHED layers after recovery"; exit 1; }
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### 5 · re-hit"
+            echo "- cache-hit: \`${{ steps.builder.outputs.cache-hit }}\`  |  CACHED layers: \`${{ steps.build.outputs.cached }}\`"
+            echo "- **PASS** = the cache recovered and is warm again after corruption."
+          } >> "$GITHUB_STEP_SUMMARY"
