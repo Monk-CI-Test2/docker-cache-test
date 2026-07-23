@@ -16,6 +16,8 @@ name: Docker Cache — E2E (corruption + full recovery matrix)
 #             released, exactly what the agent's preflight must detect)
 #   recover   acquire (fallback ALLOWED) -> the agent must NOT hang and the build
 #             MUST succeed via reformat-recovery / controller reset / local fallback
+#   rebuild   after the controller reset converges, a FRESH canonical must be
+#             acquirable; this build is expectedly cold and rewarms the cache
 #   rehit     warm acquire -> assert cache-hit + CACHED  (cache healed & warm again)
 #
 # The hard assertions are the invariants the lifecycle fixes guarantee:
@@ -223,9 +225,49 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ---------------------------------------------------------------------------
-  rehit:
-    name: 5 · re-hit (cache healed)
+  rebuild:
+    name: 5 · rebuild (fresh canonical)
     needs: recover
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      # After a CORRUPT quarantine the controller reset flow tears down and
+      # rebuilds the canonical asynchronously. Give the reconciler a moment so
+      # this acquire doesn't race the reset (nofallback would hard-fail).
+      - name: Wait for controller reset to converge
+        run: sleep 90
+      - name: Acquire (nofallback)
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Build (warms the fresh canonical; cold is EXPECTED here)
+        id: build
+        run: |
+          set -o pipefail
+          docker buildx build --builder "${MONKCI_BUILDER:-default}" \
+            --output type=cacheonly --progress plain . 2>&1 | tee /tmp/build.log
+          cached=$(grep -Eic '\bCACHED\b' /tmp/build.log || true)
+          echo "cached=$cached" >> "$GITHUB_OUTPUT"
+          # No CACHED assertion: after quarantine+reset the canonical is rebuilt
+          # EMPTY by design (corrupt data is discarded, not healed), and the
+          # recover job built on a local fallback that writes nothing. This
+          # build's job is to warm the fresh canonical and release cleanly.
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### 5 · rebuild (fresh canonical)"
+            echo "- cache-hit: \`${{ steps.builder.outputs.cache-hit }}\` (false is EXPECTED right after a quarantine+reset)"
+            echo "- CACHED layers: \`${{ steps.build.outputs.cached }}\` (0 is fine — this build rewarms the cache)"
+            echo "- **PASS** = a fresh canonical was acquirable and warmed after the reset."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  rehit:
+    name: 6 · re-hit (cache healed & warm)
+    needs: rebuild
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 20
     steps:
@@ -243,12 +285,16 @@ jobs:
             --output type=cacheonly --progress plain . 2>&1 | tee /tmp/build.log
           cached=$(grep -Eic '\bCACHED\b' /tmp/build.log || true)
           echo "cached=$cached" >> "$GITHUB_OUTPUT"
-          [ "$cached" -ge 1 ] || { echo "::error::cache did not heal — no CACHED layers after recovery"; exit 1; }
+          [ "$cached" -ge 1 ] || { echo "::error::cache did not heal — no CACHED layers after rebuild"; exit 1; }
+      - name: Assert cache-hit
+        run: |
+          hit='${{ steps.builder.outputs.cache-hit }}'
+          [ "$hit" = "true" ] || { echo "::error::expected cache-hit=true after rebuild, got '$hit'"; exit 1; }
       - name: Summary
         if: always()
         run: |
           {
-            echo "### 5 · re-hit"
+            echo "### 6 · re-hit"
             echo "- cache-hit: \`${{ steps.builder.outputs.cache-hit }}\`  |  CACHED layers: \`${{ steps.build.outputs.cached }}\`"
-            echo "- **PASS** = the cache recovered and is warm again after corruption."
+            echo "- **PASS** = full cycle proven: corrupt → detect (CORRUPT) → quarantine/reset → rebuild → warm again."
           } >> "$GITHUB_STEP_SUMMARY"
