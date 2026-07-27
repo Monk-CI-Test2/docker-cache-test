@@ -204,6 +204,13 @@ jobs:
           MP: ${{ steps.builder.outputs.mount-path }}
         run: |
           set +e
+          # SETUP GATE: A (published by L1) must be visible HERE, before the
+          # crash is injected. Otherwise L3 would conflate "L1 never published"
+          # (a publication bug) with "the crash lost last-good" (a recovery bug).
+          outA=$(bash fault/probe.sh /tmp/l2a.log --salt "lgA-$RT"); rcA=$?
+          echo "A: $outA"
+          grep -q 'salt_cached=1' <<<"$outA" || {
+            echo "::error title=lastgood::SETUP INVALID - L1's layer A is not visible to L2, so the crash test cannot attribute blame. Publication is broken upstream of the crash path (check L1's lease: release_clean / snapshot_publish_state)."; exit 1; }
           out=$(bash fault/probe.sh /tmp/l2.log --salt "lgB-$RT"); rc=$?
           set -e
           echo "$out"; tail -n 20 /tmp/l2.log
@@ -371,7 +378,7 @@ jobs:
             uf=$(grep -o 'salt_cached=[01]' <<<"$out1" | cut -d= -f2)       # want 0: nobody else's layer bleeds in
             us=$(grep -o 'salt_cached=[01]' <<<"$out2" | cut -d= -f2)       # want 1: this clone is writable
           fi
-          line="job=${{ matrix.job }} got_cache=$got cache_hit=${{ steps.builder.outputs.cache-hit }} setup_ms=$setup_ms shared_cached=$shared uniq_first=$uf uniq_second=$us"
+          line="job=${{ matrix.job }} got_cache=$got cache_hit=${{ steps.builder.outputs.cache-hit }} cache_role=${{ steps.builder.outputs.cache-role }} setup_ms=$setup_ms shared_cached=$shared uniq_first=$uf uniq_second=$us"
           echo "$line"
           echo "r${{ matrix.job }}=$line" >> "$GITHUB_OUTPUT"
 
@@ -396,43 +403,61 @@ jobs:
           {
             echo "### P2/P3 - parallel fan-out"
             echo ""
-            echo "| job | got builder | cache-hit | setup (ms) | shared CACHED (want 1) | uniq 1st (want 0) | uniq 2nd (want 1) |"
-            echo "|---|---|---|---|---|---|---|"
+            echo "| job | got builder | cache-hit | role | setup (ms) | shared CACHED (want 1) | uniq 1st (want 0) | uniq 2nd (want 1) |"
+            echo "|---|---|---|---|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
           fail=0; n=0; ok_shared=0; ok_iso=0; ok_write=0; hits=0
+          declare -A role_of
+          writers=""; clones=""
           while IFS= read -r line; do
             [ -z "$line" ] && continue
-            job=; got_cache=; cache_hit=; setup_ms=; shared_cached=; uniq_first=; uniq_second=
+            job=; got_cache=; cache_hit=; cache_role=; setup_ms=; shared_cached=; uniq_first=; uniq_second=
             declare $line
             n=$((n+1))
+            role_of[$job]="$cache_role"
+            [ "$cache_role" = "canonical_writer" ] && writers="$writers $job"
+            [ "$cache_role" = "disposable_clone" ] && clones="$clones $job"
             [ "$cache_hit" = "true" ] && hits=$((hits+1))
             [ "$shared_cached" = "1" ] && ok_shared=$((ok_shared+1))
             [ "$uniq_first" = "0" ] && ok_iso=$((ok_iso+1))
             [ "$uniq_second" = "1" ] && ok_write=$((ok_write+1))
-            echo "| $job | $got_cache | ${cache_hit:--} | $setup_ms | $shared_cached | $uniq_first | $uniq_second |" >> "$GITHUB_STEP_SUMMARY"
+            echo "| $job | $got_cache | ${cache_hit:--} | ${cache_role:-unknown} | $setup_ms | $shared_cached | $uniq_first | $uniq_second |" >> "$GITHUB_STEP_SUMMARY"
           done < <(jq -r 'to_entries | sort_by(.key | ltrimstr("r") | tonumber) | .[].value' <<<"$PAR")
           [ "$n" -eq 8 ] || { echo "::error title=parallel::only $n/8 fan jobs reported"; fail=1; }
           [ "$ok_shared" -eq "$n" ] || { echo "::error title=parallel::$((n-ok_shared)) job(s) did NOT see the shared layer CACHED - parallel snapshot reads broken"; fail=1; }
           [ "$ok_iso" -eq "$n" ] || { echo "::error title=parallel::a brand-new unique salt was already CACHED - cross-clone bleed or key collision"; fail=1; }
           [ "$ok_write" -eq "$n" ] || { echo "::error title=parallel::$((n-ok_write)) clone(s) not writable in-job"; fail=1; }
-          # Single-writer check: at most ONE fan job's unique layer may have
-          # persisted into last-good (the canonical writer). >1 = writer lease
-          # was held by more than one job at once.
+          # Writer-lock exclusivity is one writer AT A TIME, not one per
+          # fan-out: staggered jobs legitimately acquire the writer lease
+          # sequentially, and each clean sequential writer may publish. The
+          # assertions are therefore:
+          #   * no disposable clone's unique layer may persist (clone writes
+          #     are discarded by design), attributed via the cache-role output;
+          #   * >=1 writer with 0 persisted layers = publication broken;
+          #   * interval-overlap is a one-time OUT-OF-BAND ledger check (the
+          #     writer-lock Lua enforces exclusivity structurally).
           persisted=0; who=""
           for j in 1 2 3 4 5 6 7 8; do
             out=$(bash fault/probe.sh "/tmp/pv$j.log" --salt "puniq-$RT-$j")
-            if grep -q 'salt_cached=1' <<<"$out"; then persisted=$((persisted+1)); who="$who $j"; fi
+            if grep -q 'salt_cached=1' <<<"$out"; then
+              persisted=$((persisted+1)); who="$who $j"
+              case "${role_of[$j]:-}" in
+                disposable_clone)
+                  echo "::error title=parallel::job $j was a disposable clone but its unique layer PERSISTED into last-good - clone writes must be discarded"; fail=1 ;;
+                canonical_writer) ;;
+                *)
+                  echo "::warning title=parallel::job $j's layer persisted but its role is unknown (old agent without cache-role output) - attribute via the lease ledger" ;;
+              esac
+            fi
           done
+          nw=$(echo $writers | wc -w)
           {
             echo ""
-            echo "- fan jobs with cache-hit: **$hits/$n**"
-            echo "- unique layers persisted into last-good: **$persisted** (jobs:${who:- none}) - want **<= 1** (the single canonical writer)"
+            echo "- fan jobs with cache-hit: **$hits/$n** | writer-role jobs:${writers:- none} | clone-role jobs:${clones:- none}"
+            echo "- unique layers persisted into last-good: **$persisted** (jobs:${who:- none}) - each must belong to a writer-role job; count may legitimately exceed 1 (sequential writers)"
           } >> "$GITHUB_STEP_SUMMARY"
-          if [ "$persisted" -gt 1 ]; then
-            echo "::error title=parallel::$persisted parallel jobs' writes persisted - writer lease is NOT exclusive"; fail=1
-          elif [ "$persisted" -eq 0 ]; then
-            echo "::warning title=parallel::no parallel job's write persisted - no fan job held the writer lease (warm parallel runs never advance the cache; confirm this is intended)"
-            echo "- note: 0 persisted means warm parallel runs never advance last-good - confirm intended." >> "$GITHUB_STEP_SUMMARY"
+          if [ "$persisted" -eq 0 ] && [ "$nw" -ge 1 ]; then
+            echo "::error title=parallel::$nw fan job(s) held the writer lease but NO unique layer persisted - clean writer releases are not advancing last-good (the 30245314397 incident signature)"; fail=1
           fi
           exit "$fail"
 
@@ -501,6 +526,16 @@ jobs:
         run: |
           set +e
           MB=$((GB * 1024))
+          # SETUP GATES - all-missing is NOT LRU evidence. The incident run
+          # passed this job while publication was completely broken because
+          # "all rounds evicted" trivially satisfies the oldest-prefix check.
+          if [ "${{ steps.builder.outputs.cache-hit }}" != "true" ]; then
+            echo "::error title=lru::SETUP INVALID - no cache-hit after R1's clean release: the canonical was not persisted (publication broken); LRU ordering cannot be judged"; exit 1
+          fi
+          sentinel=$(bash fault/probe.sh /tmp/lru_sentinel.log --salt "lru-$RT")
+          if ! grep -q 'salt_cached=1' <<<"$sentinel"; then
+            echo "::error title=lru::SETUP INVALID - R1's persistence sentinel (salt lru-$RT) is not cached: last-good did not advance after R1; LRU ordering cannot be judged"; exit 1
+          fi
           declare -A cached
           for i in $(seq "$ROUNDS" -1 1); do
             out=$(bash fault/probe.sh "/tmp/lruv$i.log" --salt "lru-$RT" --bloat-salt "L$i" --bloat-mb "$MB" --timeout 1800); rc=$?
@@ -536,6 +571,12 @@ jobs:
           if [ -n "$anomaly" ]; then
             echo "::error title=lru::NON-LRU eviction - newer rounds evicted while older kept:$anomaly"
             echo "- **NON-LRU ANOMALY**:$anomaly" >> "$GITHUB_STEP_SUMMARY"
+            fail=1
+          elif [ -z "$kept" ]; then
+            # Sentinel passed but every bloat round is gone: nothing survived to
+            # order, so no LRU behavior was exercised - inconclusive, not a pass.
+            echo "::error title=lru::ALL rounds missing despite a warm canonical - no eviction ORDER was exercised (snapshot content or GC policy broken); this is not LRU evidence"
+            echo "- **INCONCLUSIVE/FAIL**: all rounds missing - no ordering exercised." >> "$GITHUB_STEP_SUMMARY"
             fail=1
           elif [ -z "$evicted" ]; then
             echo "- no eviction observed - raise lru_rounds x lru_bloat_gb above the per-repo cache size to force pressure." >> "$GITHUB_STEP_SUMMARY"
@@ -917,7 +958,7 @@ jobs:
             echo "| lastgood | L4 clean advance | ${{ needs.lastgood_advance.result }} | **BUG: clean release did not advance last-good** |"
             echo "| parallel | P1 seed | ${{ needs.par_seed.result }} | infra |"
             echo "| parallel | P2 fan x8 | ${{ needs.par_fan.result }} | acquire/build failed under contention |"
-            echo "| parallel | P3 isolation + single writer | ${{ needs.par_verify.result }} | **BUG: shared reads, clone isolation, or writer-lease exclusivity** |"
+            echo "| parallel | P3 isolation + role-attributed persistence | ${{ needs.par_verify.result }} | **BUG: shared reads, clone isolation, a clone write persisting, or writers not publishing** |"
             echo "| lru | R1 churn | ${{ needs.lru_churn.result }} | **BUG if HANG; warning-only for ENOSPC rounds** |"
             echo "| lru | R2 eviction order | ${{ needs.lru_verify.result }} | **BUG: non-LRU eviction (newer evicted before older)** |"
             echo "| org-lru | O1 probe | ${{ needs.org_probe.result }} | see job summary (needs controller-side confirmation) |"
