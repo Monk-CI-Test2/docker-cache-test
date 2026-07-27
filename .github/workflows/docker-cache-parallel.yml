@@ -67,6 +67,10 @@ jobs:
     if: ${{ inputs.warmup }}
     runs-on: ${{ inputs.writer_runner }}
     timeout-minutes: 180
+    # Result is passed to the report as a job output, NOT an artifact: artifact
+    # storage is billed, and a failed/blocked upload must never fail a cache test.
+    outputs:
+      w: ${{ steps.rec.outputs.w }}
     steps:
       - name: Fetch PostHog source
         shell: bash
@@ -110,51 +114,34 @@ jobs:
             --output type=cacheonly posthog 2>&1 | tee /tmp/build.log
           date +%s%3N > /tmp/t_build_end
       - name: Record result
+        id: rec
         if: ${{ !cancelled() }}
         shell: bash
         env:
           ROLE: writer
           JOB_ID: warmup
+          OUT_KEY: w
           BUILD_OUTCOME: ${{ steps.build.outcome }}
           SETUP_OUTCOME: ${{ steps.builder.outcome }}
           CACHE_HIT: ${{ steps.builder.outputs.cache-hit }}
           MOUNT_PATH: ${{ steps.builder.outputs.mount-path }}
         run: |
-          bash "$GITHUB_WORKSPACE/.ci/record.sh" 2>/dev/null || {
-            # record.sh may not exist (repo has no checkout); inline fallback below
-            :
-          }
-          # ---- inline recorder (no repo checkout in this job) ----
           set -uo pipefail
           ms() { cat "$1" 2>/dev/null || echo 0; }
           SU_S=$(ms /tmp/t_setup_start); SU_E=$(ms /tmp/t_setup_end)
           B_S=$(ms /tmp/t_build_start); B_E=$(ms /tmp/t_build_end)
           setup_sec=$(awk -v a="$SU_S" -v b="$SU_E" 'BEGIN{ if(a>0&&b>=a) printf "%.1f",(b-a)/1000; else print "-" }')
           build_sec=$(awk -v a="$B_S" -v b="$B_E" 'BEGIN{ if(a>0&&b>=a) printf "%.1f",(b-a)/1000; else print "-" }')
-          CACHED=$(grep -Eic '\bCACHED\b' /tmp/build.log 2>/dev/null || echo 0)
-          TOTAL=$(grep -Eoc '^#[0-9]+ ' /tmp/build.log 2>/dev/null || echo 0)
+          CACHED=$(grep -Eic '\bCACHED\b' /tmp/build.log 2>/dev/null | head -1); CACHED=${CACHED:-0}
+          TOTAL=$(grep -Eoc '^#[0-9]+ ' /tmp/build.log 2>/dev/null | head -1); TOTAL=${TOTAL:-0}
           GOT_CACHE=$([[ -n "${MONKCI_BUILDER:-}" ]] && echo true || echo false)
           FS_SIZE=""; FS_USED=""
           if [[ -n "${MOUNT_PATH:-}" ]] && df -B1 "$MOUNT_PATH" >/dev/null 2>&1; then
             read -r FS_SIZE FS_USED < <(df -B1 --output=size,used "$MOUNT_PATH" | tail -1 | awk '{print $1,$2}')
           fi
-          mkdir -p /tmp/results
-          {
-            echo "role=$ROLE"; echo "job=$JOB_ID"
-            echo "setup_outcome=${SETUP_OUTCOME:-unknown}"; echo "build_outcome=${BUILD_OUTCOME:-unknown}"
-            echo "got_cache=$GOT_CACHE"; echo "cache_hit=${CACHE_HIT:-}"
-            echo "cache_setup_sec=$setup_sec"; echo "build_sec=$build_sec"
-            echo "cached_steps=$CACHED"; echo "total_steps=$TOTAL"
-            echo "cache_fs_size_bytes=${FS_SIZE:-}"; echo "cache_fs_used_bytes=${FS_USED:-}"
-          } | tee "/tmp/results/result-$ROLE-$JOB_ID.env"
-      - name: Upload result
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: result-writer-warmup
-          path: /tmp/results/
-          if-no-files-found: warn
-          retention-days: 7
+          line="role=$ROLE job=$JOB_ID setup_outcome=${SETUP_OUTCOME:-unknown} build_outcome=${BUILD_OUTCOME:-unknown} got_cache=$GOT_CACHE cache_hit=${CACHE_HIT:-} cache_setup_sec=$setup_sec build_sec=$build_sec cached_steps=$CACHED total_steps=$TOTAL cache_fs_size_bytes=${FS_SIZE:-} cache_fs_used_bytes=${FS_USED:-}"
+          echo "$line"
+          echo "$OUT_KEY=$line" >> "$GITHUB_OUTPUT"
 
   fanout:
     name: cache-job-${{ matrix.job }}
@@ -167,6 +154,29 @@ jobs:
       max-parallel: 20
       matrix:
         job: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    # Each matrix leg sets ONLY its own rN key, so the merged outputs map keeps
+    # every leg's result. Job outputs replace the old per-job artifacts.
+    outputs:
+      r1: ${{ steps.rec.outputs.r1 }}
+      r2: ${{ steps.rec.outputs.r2 }}
+      r3: ${{ steps.rec.outputs.r3 }}
+      r4: ${{ steps.rec.outputs.r4 }}
+      r5: ${{ steps.rec.outputs.r5 }}
+      r6: ${{ steps.rec.outputs.r6 }}
+      r7: ${{ steps.rec.outputs.r7 }}
+      r8: ${{ steps.rec.outputs.r8 }}
+      r9: ${{ steps.rec.outputs.r9 }}
+      r10: ${{ steps.rec.outputs.r10 }}
+      r11: ${{ steps.rec.outputs.r11 }}
+      r12: ${{ steps.rec.outputs.r12 }}
+      r13: ${{ steps.rec.outputs.r13 }}
+      r14: ${{ steps.rec.outputs.r14 }}
+      r15: ${{ steps.rec.outputs.r15 }}
+      r16: ${{ steps.rec.outputs.r16 }}
+      r17: ${{ steps.rec.outputs.r17 }}
+      r18: ${{ steps.rec.outputs.r18 }}
+      r19: ${{ steps.rec.outputs.r19 }}
+      r20: ${{ steps.rec.outputs.r20 }}
     steps:
       - name: Fetch PostHog source
         shell: bash
@@ -210,6 +220,7 @@ jobs:
             --output type=cacheonly posthog 2>&1 | tee /tmp/build.log
           date +%s%3N > /tmp/t_build_end
       - name: Record result
+        id: rec
         if: ${{ !cancelled() }}
         shell: bash
         env:
@@ -226,30 +237,16 @@ jobs:
           B_S=$(ms /tmp/t_build_start); B_E=$(ms /tmp/t_build_end)
           setup_sec=$(awk -v a="$SU_S" -v b="$SU_E" 'BEGIN{ if(a>0&&b>=a) printf "%.1f",(b-a)/1000; else print "-" }')
           build_sec=$(awk -v a="$B_S" -v b="$B_E" 'BEGIN{ if(a>0&&b>=a) printf "%.1f",(b-a)/1000; else print "-" }')
-          CACHED=$(grep -Eic '\bCACHED\b' /tmp/build.log 2>/dev/null || echo 0)
-          TOTAL=$(grep -Eoc '^#[0-9]+ ' /tmp/build.log 2>/dev/null || echo 0)
+          CACHED=$(grep -Eic '\bCACHED\b' /tmp/build.log 2>/dev/null | head -1); CACHED=${CACHED:-0}
+          TOTAL=$(grep -Eoc '^#[0-9]+ ' /tmp/build.log 2>/dev/null | head -1); TOTAL=${TOTAL:-0}
           GOT_CACHE=$([[ -n "${MONKCI_BUILDER:-}" ]] && echo true || echo false)
           FS_SIZE=""; FS_USED=""
           if [[ -n "${MOUNT_PATH:-}" ]] && df -B1 "$MOUNT_PATH" >/dev/null 2>&1; then
             read -r FS_SIZE FS_USED < <(df -B1 --output=size,used "$MOUNT_PATH" | tail -1 | awk '{print $1,$2}')
           fi
-          mkdir -p /tmp/results
-          {
-            echo "role=$ROLE"; echo "job=$JOB_ID"
-            echo "setup_outcome=${SETUP_OUTCOME:-unknown}"; echo "build_outcome=${BUILD_OUTCOME:-unknown}"
-            echo "got_cache=$GOT_CACHE"; echo "cache_hit=${CACHE_HIT:-}"
-            echo "cache_setup_sec=$setup_sec"; echo "build_sec=$build_sec"
-            echo "cached_steps=$CACHED"; echo "total_steps=$TOTAL"
-            echo "cache_fs_size_bytes=${FS_SIZE:-}"; echo "cache_fs_used_bytes=${FS_USED:-}"
-          } | tee "/tmp/results/result-$ROLE-$JOB_ID.env"
-      - name: Upload result
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: result-reader-${{ matrix.job }}
-          path: /tmp/results/
-          if-no-files-found: warn
-          retention-days: 7
+          line="role=$ROLE job=$JOB_ID setup_outcome=${SETUP_OUTCOME:-unknown} build_outcome=${BUILD_OUTCOME:-unknown} got_cache=$GOT_CACHE cache_hit=${CACHE_HIT:-} cache_setup_sec=$setup_sec build_sec=$build_sec cached_steps=$CACHED total_steps=$TOTAL cache_fs_size_bytes=${FS_SIZE:-} cache_fs_used_bytes=${FS_USED:-}"
+          echo "$line"
+          echo "r$JOB_ID=$line" >> "$GITHUB_OUTPUT"
 
   report:
     name: cache-report
@@ -259,18 +256,15 @@ jobs:
     runs-on: ${{ inputs.reader_runner }}
     timeout-minutes: 10
     steps:
-      - name: Download all results
-        uses: actions/download-artifact@v4
-        with:
-          pattern: result-*
-          path: results
-          merge-multiple: true
+      # Results arrive as job outputs (no artifacts -> no storage billing, and
+      # no report breakage when artifact upload is blocked by billing).
       - name: Render run summary
         shell: bash
+        env:
+          WRITER: ${{ needs.warmup.outputs.w }}
+          FAN: ${{ toJSON(needs.fanout.outputs) }}
         run: |
           set -uo pipefail
-          shopt -s nullglob
-          files=(results/result-*.env)
           {
             echo "## PostHog docker-cache 20x parallel report"
             echo ""
@@ -282,10 +276,11 @@ jobs:
           rc=0; rsum=0; rmin=999999; rmax=0
           scount=0; ssum=0
           fs_sum=0; fs_count=0; w_build="-"; w_setup="-"
-          for f in "${files[@]}"; do
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
             role=""; job=""; got_cache=""; cache_hit=""; build_outcome=""
             cache_setup_sec=""; build_sec=""; cached_steps=""; cache_fs_used_bytes=""
-            source "$f"
+            declare $line
             total=$((total+1))
             [[ "$got_cache" == "true" ]] && with_cache=$((with_cache+1))
             [[ "$cache_hit" == "true" ]] && hits=$((hits+1))
@@ -305,7 +300,7 @@ jobs:
             fi
             [[ "$role" == "writer" ]] && { w_build="$build_sec"; w_setup="$cache_setup_sec"; }
             echo "| $job | $role | $got_cache | ${cache_hit:--} | $build_outcome | $cache_setup_sec | $build_sec | $cached_steps | $fs_h |" >> "$GITHUB_STEP_SUMMARY"
-          done
+          done < <(printf '%s\n' "$WRITER"; jq -r 'to_entries | sort_by(.key | ltrimstr("r") | tonumber) | .[].value' <<<"$FAN")
 
           avg_rb="-"; [[ $rc -gt 0 ]] && avg_rb=$((rsum/rc))
           avg_s="-"; [[ $scount -gt 0 ]] && avg_s=$((ssum/scount))

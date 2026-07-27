@@ -1,0 +1,933 @@
+name: Docker Cache - Fault Matrix
+
+# One dispatchable workflow that exercises the Ceph RBD docker cache in every
+# faulty way we know how to provoke from a runner, to surface deployment bugs.
+# Pick a single scenario or run `all` (scenarios are chained with `needs:` so
+# they serialize against the SAME per-repo canonical cache; each scenario seeds
+# its own salts, so any scenario is also valid standalone).
+#
+#   cache-write     W1 seed a unique layer, clean release ->
+#                   W2 fresh runner must get cache-hit and see it CACHED.
+#                   Proves the write -> snapshot publish -> read-back path.
+#   lastgood        L1 seed A (clean) -> L2 build B then CRASH (stop BuildKit,
+#                   remove clean-shutdown marker; DBs left intact) ->
+#                   L3 next acquire must serve the previous last-good: A CACHED,
+#                   dirty B NOT cached; L3 then rebuilds B cleanly ->
+#                   L4 B CACHED (last-good advanced). Catches: dirty writes
+#                   leaking into last-good, or a mere crash nuking the cache.
+#   parallel        P1 seed a shared layer -> P2 8 jobs race in at once, each
+#                   asserts the shared layer is CACHED (parallel snapshot
+#                   reads), writes a unique layer, and re-builds it in-job
+#                   (clone is writable) -> P3 counts how many unique layers
+#                   PERSISTED into last-good. >1 persisted = more than one
+#                   writer held the canonical (lease exclusivity bug).
+#   lru             R1 one job builds `lru_rounds` unique layers of
+#                   `lru_bloat_gb` GiB each (make rounds x GiB exceed the cache
+#                   size to force pressure) -> R2 probes every round newest ->
+#                   oldest. Evicted rounds must be the OLDEST prefix; holes
+#                   (new evicted, old kept) = non-LRU eviction bug. ENOSPC or
+#                   hangs during churn = write-pressure bug.
+#   org-lru         After the bloat, a fresh acquire reports whether THIS
+#                   repo's canonical survived (cache-hit) or was evicted by
+#                   org-level LRU. Org-wide effects (other repos evicted) are
+#                   only visible controller-side; the summary prints the greps.
+#   io-failures     I1 fill the mounted cache to ENOSPC mid-lease and build
+#                   (must fail cleanly or GC, never hang), then recover
+#                   in-place; also tries a read-only remount. I2 corrupts and
+#                   deletes content blobs (DBs untouched) and rebuilds a
+#                   known-cached salt (read-path damage must not hang).
+#                   I3 a fresh acquire (fallback allowed) must still build.
+#   corrupt-recover C1 stop BuildKit + remove marker + delete BuildKit DBs
+#                   (keep snapshot dirs) -> C2 acquire must not hang and the
+#                   build MUST pass (recovery or local fallback) -> C3 a fresh
+#                   canonical is acquirable after the controller reset ->
+#                   C4 warm again (cache-hit + CACHED).
+#
+# All assertions land in the run summary; the final `outcomes` job renders a
+# scenario x result table telling you which failures indicate cache bugs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "Which fault scenario to run"
+        default: "all"
+        type: choice
+        options:
+          - "all"
+          - "cache-write"
+          - "lastgood"
+          - "parallel"
+          - "lru"
+          - "org-lru"
+          - "io-failures"
+          - "corrupt-recover"
+      runner:
+        description: "Runner label for every job"
+        default: "monkci-ubuntu-24.04-4"
+        type: choice
+        options:
+          - "monkci-ubuntu-24.04-4"
+          - "monkci-ubuntu-24.04-2"
+          - "monkci-ubuntu-24.04-8"
+      lru_bloat_gb:
+        description: "GiB of unique layer data per LRU round"
+        default: "6"
+        type: string
+      lru_rounds:
+        description: "LRU rounds (rounds x GiB should exceed the per-repo cache size)"
+        default: "8"
+        type: string
+
+# No concurrency group on purpose: a wedged manual run must never block a
+# fresh dispatch (same convention as the other cache test workflows).
+
+permissions:
+  contents: read
+
+env:
+  RT: ${{ github.run_id }}-${{ github.run_attempt }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ===========================================================================
+  # SCENARIO: cache-write — the plain write -> publish -> read-back contract
+  # ===========================================================================
+  write_seed:
+    name: "W1 - cache-write - seed unique layer"
+    if: ${{ !cancelled() && (inputs.scenario == 'all' || inputs.scenario == 'cache-write') }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire (nofallback)
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Build unique salted layer (must WRITE the cache)
+        run: |
+          set +e
+          out=$(bash fault/probe.sh /tmp/w1.log --salt "w-$RT"); rc=$?
+          set -e
+          echo "$out"; tail -n 20 /tmp/w1.log
+          [ "$rc" -eq 0 ] || { echo "::error title=cache-write::seed build failed (rc=$rc)"; exit 1; }
+          grep -q 'salt_cached=0' <<<"$out" || echo "::warning title=cache-write::brand-new salt reported CACHED - stale cache key collision?"
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### W1 - cache-write seed"
+            echo "- acquire cache-hit: \`${{ steps.builder.outputs.cache-hit }}\` | mount: \`${{ steps.builder.outputs.mount-path }}\`"
+            echo "- built salt \`w-$RT\`; a clean release now must publish it into last-good."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  write_verify:
+    name: "W2 - cache-write - read back on fresh runner"
+    needs: write_seed
+    if: ${{ !cancelled() && (inputs.scenario == 'all' || inputs.scenario == 'cache-write') }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire (nofallback)
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Assert the seeded layer is CACHED here
+        run: |
+          set +e
+          out=$(bash fault/probe.sh /tmp/w2.log --salt "w-$RT"); rc=$?
+          set -e
+          echo "$out"; tail -n 20 /tmp/w2.log
+          fail=0
+          [ "${{ steps.builder.outputs.cache-hit }}" = "true" ] || { echo "::error title=cache-write::expected cache-hit=true after seed"; fail=1; }
+          grep -q 'salt_cached=1' <<<"$out" || { echo "::error title=cache-write::seeded layer NOT cached - cache write or snapshot publish is broken"; fail=1; }
+          [ "$rc" -eq 0 ] || { echo "::error title=cache-write::read-back build failed (rc=$rc)"; fail=1; }
+          exit "$fail"
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### W2 - cache-write read-back"
+            echo "- cache-hit: \`${{ steps.builder.outputs.cache-hit }}\`"
+            echo "- **PASS** = a layer written by one job is served CACHED to the next job. FAIL here = the basic cache write path is broken."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ===========================================================================
+  # SCENARIO: lastgood — crash must not publish; last-good must survive a crash
+  # ===========================================================================
+  lastgood_seed:
+    name: "L1 - lastgood - seed A (clean release)"
+    needs: write_verify
+    if: ${{ !cancelled() && (inputs.scenario == 'all' || inputs.scenario == 'lastgood') }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire (nofallback)
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Build salt A
+        run: |
+          set +e
+          out=$(bash fault/probe.sh /tmp/l1.log --salt "lgA-$RT"); rc=$?
+          set -e
+          echo "$out"; tail -n 20 /tmp/l1.log
+          [ "$rc" -eq 0 ] || { echo "::error title=lastgood::seed A build failed (rc=$rc)"; exit 1; }
+      - name: Summary
+        if: always()
+        run: |
+          echo "### L1 - lastgood seed: built \`lgA-$RT\`, clean release publishes it as last-good." >> "$GITHUB_STEP_SUMMARY"
+
+  lastgood_dirty:
+    name: "L2 - lastgood - build B then CRASH (unclean release)"
+    needs: lastgood_seed
+    if: ${{ !cancelled() && (inputs.scenario == 'all' || inputs.scenario == 'lastgood') }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire (nofallback)
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Build salt B, then simulate a crash before release
+        env:
+          MP: ${{ steps.builder.outputs.mount-path }}
+        run: |
+          set +e
+          out=$(bash fault/probe.sh /tmp/l2.log --salt "lgB-$RT"); rc=$?
+          set -e
+          echo "$out"; tail -n 20 /tmp/l2.log
+          [ "$rc" -eq 0 ] || { echo "::error title=lastgood::build of B failed before we could crash (rc=$rc)"; exit 1; }
+          # Crash simulation = stop BuildKit so the agent's release stop fails
+          # (unclean release, no snapshot publish) and remove the clean-shutdown
+          # marker so the next acquire reads a crash. DBs are LEFT INTACT - this
+          # is a crash, not corruption (corrupt-recover covers that).
+          BKC=$(docker ps --format '{{.Names}} {{.Image}}' | grep -iE 'buildkit|moby' | awk '{print $1}' | head -1)
+          if [ -n "${BKC:-}" ]; then echo "stopping BuildKit: $BKC"; sudo docker stop -t 5 "$BKC" || true
+          else echo "::warning title=lastgood::no BuildKit container found to stop"; fi
+          [ -n "${MP:-}" ] && sudo rm -f "$MP/.monkci-clean-shutdown" || true
+      - name: Summary
+        if: always()
+        run: |
+          echo "### L2 - lastgood dirty: built \`lgB-$RT\` on the lease, then crashed (BuildKit stopped, marker removed, DBs intact). B must NOT reach last-good." >> "$GITHUB_STEP_SUMMARY"
+
+  lastgood_check:
+    name: "L3 - lastgood - A survives, dirty B discarded"
+    needs: lastgood_dirty
+    if: ${{ !cancelled() && (inputs.scenario == 'all' || inputs.scenario == 'lastgood') }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire (nofallback)
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Assert last-good semantics after the crash
+        id: check
+        run: |
+          set +e
+          outA=$(bash fault/probe.sh /tmp/l3a.log --salt "lgA-$RT"); rcA=$?
+          outB=$(bash fault/probe.sh /tmp/l3b.log --salt "lgB-$RT"); rcB=$?
+          set -e
+          echo "A: $outA"; echo "B: $outB"
+          a=$(grep -o 'salt_cached=[01]' <<<"$outA" | cut -d= -f2)
+          b=$(grep -o 'salt_cached=[01]' <<<"$outB" | cut -d= -f2)
+          echo "a_cached=$a" >> "$GITHUB_OUTPUT"; echo "b_cached=$b" >> "$GITHUB_OUTPUT"
+          fail=0
+          [ "${{ steps.builder.outputs.cache-hit }}" = "true" ] || { echo "::error title=lastgood::no cache-hit after a mere crash - last-good snapshot was lost (crash nuked the cache?)"; fail=1; }
+          [ "$a" = "1" ] || { echo "::error title=lastgood::pre-crash layer A is gone - crash recovery discarded last-good instead of rolling back to it"; fail=1; }
+          [ "$b" = "0" ] || { echo "::error title=lastgood::dirty layer B IS cached - an UNCLEAN release published to last-good (lastgood gate broken)"; fail=1; }
+          [ "$rcA" -eq 0 ] && [ "$rcB" -eq 0 ] || { echo "::error title=lastgood::rebuild failed (rcA=$rcA rcB=$rcB)"; fail=1; }
+          # rcB=0 means B was just rebuilt CLEANLY on this lease; the clean
+          # release of this job must now advance last-good to include B.
+          exit "$fail"
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### L3 - lastgood check"
+            echo "- cache-hit: \`${{ steps.builder.outputs.cache-hit }}\` | A cached: \`${{ steps.check.outputs.a_cached }}\` (want 1) | dirty B cached: \`${{ steps.check.outputs.b_cached }}\` (want 0)"
+            echo "- **PASS** = crash rolled back to last-good: A kept, dirty B discarded. B was then rebuilt cleanly here."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  lastgood_advance:
+    name: "L4 - lastgood - clean release advances last-good"
+    needs: lastgood_check
+    if: ${{ !cancelled() && (inputs.scenario == 'all' || inputs.scenario == 'lastgood') }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire (nofallback)
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Assert B (rebuilt cleanly in L3) is now in last-good
+        id: check
+        run: |
+          set +e
+          outB=$(bash fault/probe.sh /tmp/l4.log --salt "lgB-$RT"); rcB=$?
+          set -e
+          echo "B: $outB"
+          b=$(grep -o 'salt_cached=[01]' <<<"$outB" | cut -d= -f2)
+          echo "b_cached=$b" >> "$GITHUB_OUTPUT"
+          [ "$b" = "1" ] || { echo "::error title=lastgood::B not cached after a CLEAN release - last-good did not advance"; exit 1; }
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### L4 - lastgood advance"
+            echo "- B cached after clean release: \`${{ steps.check.outputs.b_cached }}\` (want 1)"
+            echo "- **PASS** = last-good only moves on clean release, and it DOES move on clean release."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ===========================================================================
+  # SCENARIO: parallel — concurrent clones, write isolation, single writer
+  # ===========================================================================
+  par_seed:
+    name: "P1 - parallel - seed shared layer"
+    needs: lastgood_advance
+    if: ${{ !cancelled() && (inputs.scenario == 'all' || inputs.scenario == 'parallel') }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire (nofallback)
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Build the shared layer every parallel job must see
+        run: |
+          set +e
+          out=$(bash fault/probe.sh /tmp/p1.log --salt "pshared-$RT"); rc=$?
+          set -e
+          echo "$out"; [ "$rc" -eq 0 ] || { tail -n 20 /tmp/p1.log; exit 1; }
+      - name: Summary
+        if: always()
+        run: |
+          echo "### P1 - parallel seed: built \`pshared-$RT\`; clean release publishes it for the 8-way fan-out." >> "$GITHUB_STEP_SUMMARY"
+
+  par_fan:
+    name: "P2 - parallel - fan ${{ matrix.job }}/8"
+    needs: par_seed
+    if: ${{ !cancelled() && (inputs.scenario == 'all' || inputs.scenario == 'parallel') }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        job: [1, 2, 3, 4, 5, 6, 7, 8]
+    # Results are passed to P3 as job outputs, NOT artifacts (artifact storage
+    # is billed and an upload failure must never fail a cache test). Each
+    # matrix leg sets only its own rN key, so the merged outputs map keeps all.
+    outputs:
+      r1: ${{ steps.probes.outputs.r1 }}
+      r2: ${{ steps.probes.outputs.r2 }}
+      r3: ${{ steps.probes.outputs.r3 }}
+      r4: ${{ steps.probes.outputs.r4 }}
+      r5: ${{ steps.probes.outputs.r5 }}
+      r6: ${{ steps.probes.outputs.r6 }}
+      r7: ${{ steps.probes.outputs.r7 }}
+      r8: ${{ steps.probes.outputs.r8 }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mark setup start
+        run: date +%s%3N > /tmp/t0
+      # nofallback ON: under 8-way contention an acquire failure is exactly the
+      # kind of bug this scenario exists to expose - surface it, don't mask it.
+      - name: Acquire (nofallback)
+        id: builder
+        continue-on-error: true
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Probe shared read + isolated write on this clone
+        id: probes
+        run: |
+          set +e
+          t1=$(date +%s%3N); setup_ms=$((t1 - $(cat /tmp/t0)))
+          got=false; shared=-; uf=-; us=-
+          if [ -n "${MONKCI_BUILDER:-}" ]; then
+            got=true
+            outS=$(bash fault/probe.sh /tmp/ps.log --salt "pshared-$RT")
+            out1=$(bash fault/probe.sh /tmp/pu1.log --salt "puniq-$RT-${{ matrix.job }}")
+            out2=$(bash fault/probe.sh /tmp/pu2.log --salt "puniq-$RT-${{ matrix.job }}")
+            shared=$(grep -o 'salt_cached=[01]' <<<"$outS" | cut -d= -f2)   # want 1: parallel read of the shared snapshot
+            uf=$(grep -o 'salt_cached=[01]' <<<"$out1" | cut -d= -f2)       # want 0: nobody else's layer bleeds in
+            us=$(grep -o 'salt_cached=[01]' <<<"$out2" | cut -d= -f2)       # want 1: this clone is writable
+          fi
+          line="job=${{ matrix.job }} got_cache=$got cache_hit=${{ steps.builder.outputs.cache-hit }} setup_ms=$setup_ms shared_cached=$shared uniq_first=$uf uniq_second=$us"
+          echo "$line"
+          echo "r${{ matrix.job }}=$line" >> "$GITHUB_OUTPUT"
+
+  par_verify:
+    name: "P3 - parallel - isolation + single-writer verdict"
+    needs: par_fan
+    if: ${{ !cancelled() && (inputs.scenario == 'all' || inputs.scenario == 'parallel') }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire (nofallback)
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Verdict
+        env:
+          PAR: ${{ toJSON(needs.par_fan.outputs) }}
+        run: |
+          set +e
+          {
+            echo "### P2/P3 - parallel fan-out"
+            echo ""
+            echo "| job | got builder | cache-hit | setup (ms) | shared CACHED (want 1) | uniq 1st (want 0) | uniq 2nd (want 1) |"
+            echo "|---|---|---|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          fail=0; n=0; ok_shared=0; ok_iso=0; ok_write=0; hits=0
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            job=; got_cache=; cache_hit=; setup_ms=; shared_cached=; uniq_first=; uniq_second=
+            declare $line
+            n=$((n+1))
+            [ "$cache_hit" = "true" ] && hits=$((hits+1))
+            [ "$shared_cached" = "1" ] && ok_shared=$((ok_shared+1))
+            [ "$uniq_first" = "0" ] && ok_iso=$((ok_iso+1))
+            [ "$uniq_second" = "1" ] && ok_write=$((ok_write+1))
+            echo "| $job | $got_cache | ${cache_hit:--} | $setup_ms | $shared_cached | $uniq_first | $uniq_second |" >> "$GITHUB_STEP_SUMMARY"
+          done < <(jq -r 'to_entries | sort_by(.key | ltrimstr("r") | tonumber) | .[].value' <<<"$PAR")
+          [ "$n" -eq 8 ] || { echo "::error title=parallel::only $n/8 fan jobs reported"; fail=1; }
+          [ "$ok_shared" -eq "$n" ] || { echo "::error title=parallel::$((n-ok_shared)) job(s) did NOT see the shared layer CACHED - parallel snapshot reads broken"; fail=1; }
+          [ "$ok_iso" -eq "$n" ] || { echo "::error title=parallel::a brand-new unique salt was already CACHED - cross-clone bleed or key collision"; fail=1; }
+          [ "$ok_write" -eq "$n" ] || { echo "::error title=parallel::$((n-ok_write)) clone(s) not writable in-job"; fail=1; }
+          # Single-writer check: at most ONE fan job's unique layer may have
+          # persisted into last-good (the canonical writer). >1 = writer lease
+          # was held by more than one job at once.
+          persisted=0; who=""
+          for j in 1 2 3 4 5 6 7 8; do
+            out=$(bash fault/probe.sh "/tmp/pv$j.log" --salt "puniq-$RT-$j")
+            if grep -q 'salt_cached=1' <<<"$out"; then persisted=$((persisted+1)); who="$who $j"; fi
+          done
+          {
+            echo ""
+            echo "- fan jobs with cache-hit: **$hits/$n**"
+            echo "- unique layers persisted into last-good: **$persisted** (jobs:${who:- none}) - want **<= 1** (the single canonical writer)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$persisted" -gt 1 ]; then
+            echo "::error title=parallel::$persisted parallel jobs' writes persisted - writer lease is NOT exclusive"; fail=1
+          elif [ "$persisted" -eq 0 ]; then
+            echo "::warning title=parallel::no parallel job's write persisted - no fan job held the writer lease (warm parallel runs never advance the cache; confirm this is intended)"
+            echo "- note: 0 persisted means warm parallel runs never advance last-good - confirm intended." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$fail"
+
+  # ===========================================================================
+  # SCENARIO: lru — repo-level eviction order under size pressure
+  # ===========================================================================
+  lru_churn:
+    name: "R1 - lru - bloat rounds"
+    needs: par_verify
+    if: ${{ !cancelled() && (inputs.scenario == 'all' || inputs.scenario == 'lru') }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire (nofallback)
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Build unique multi-GiB layers round after round
+        env:
+          MP: ${{ steps.builder.outputs.mount-path }}
+          GB: ${{ inputs.lru_bloat_gb }}
+          ROUNDS: ${{ inputs.lru_rounds }}
+        run: |
+          set +e
+          [[ "$GB" =~ ^[0-9]+$ && "$ROUNDS" =~ ^[0-9]+$ ]] || { echo "::error title=lru::lru_bloat_gb / lru_rounds must be integers"; exit 1; }
+          MB=$((GB * 1024)); fail=0
+          {
+            echo "### R1 - lru churn ($ROUNDS rounds x ${GB}GiB)"
+            echo ""
+            echo "| round | build rc | seconds | cache FS used after |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for i in $(seq 1 "$ROUNDS"); do
+            t0=$(date +%s)
+            out=$(bash fault/probe.sh "/tmp/lru$i.log" --salt "lru-$RT" --bloat-salt "L$i" --bloat-mb "$MB" --timeout 1800); rc=$?
+            dur=$(( $(date +%s) - t0 ))
+            used="-"
+            [ -n "${MP:-}" ] && used=$(df -B1 --output=used "$MP" 2>/dev/null | tail -1 | tr -d ' ' | numfmt --to=iec --suffix=B 2>/dev/null || echo "-")
+            echo "| L$i | $rc | $dur | $used |" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$rc" -eq 124 ]; then echo "::error title=lru::round L$i HUNG under write pressure"; fail=1
+            elif [ "$rc" -ne 0 ]; then echo "::warning title=lru::round L$i failed rc=$rc (ENOSPC without GC absorbing pressure?)"; tail -n 15 "/tmp/lru$i.log"; fi
+          done
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- a clean release now publishes the bloated last-good (COW snapshot, O(1))." >> "$GITHUB_STEP_SUMMARY"
+          exit "$fail"
+
+  lru_verify:
+    name: "R2 - lru - eviction must be oldest-first"
+    needs: lru_churn
+    if: ${{ !cancelled() && (inputs.scenario == 'all' || inputs.scenario == 'lru') }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire (nofallback)
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Probe every round, newest -> oldest
+        env:
+          GB: ${{ inputs.lru_bloat_gb }}
+          ROUNDS: ${{ inputs.lru_rounds }}
+        run: |
+          set +e
+          MB=$((GB * 1024))
+          declare -A cached
+          for i in $(seq "$ROUNDS" -1 1); do
+            out=$(bash fault/probe.sh "/tmp/lruv$i.log" --salt "lru-$RT" --bloat-salt "L$i" --bloat-mb "$MB" --timeout 1800); rc=$?
+            c=$(grep -o 'bloat_cached=[01]' <<<"$out" | cut -d= -f2)
+            [ "$rc" -eq 124 ] && c="HANG"
+            cached[$i]=$c
+            echo "L$i: cached=$c rc=$rc"
+          done
+          {
+            echo "### R2 - lru eviction pattern (probed newest -> oldest; a miss re-writes that round)"
+            echo ""
+            echo "| round | still cached |"
+            echo "|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          evicted=""; kept=""
+          for i in $(seq 1 "$ROUNDS"); do
+            echo "| L$i | ${cached[$i]} |" >> "$GITHUB_STEP_SUMMARY"
+            [ "${cached[$i]}" = "0" ] && evicted="$evicted $i" || kept="$kept $i"
+          done
+          # LRU invariant: the evicted set must be a prefix of the age order -
+          # no evicted round may be NEWER than a kept round.
+          fail=0; maxe=0
+          for e in $evicted; do [ "$e" -gt "$maxe" ] && maxe=$e; done
+          anomaly=""
+          for k in $kept; do
+            [ "${cached[$k]}" = "HANG" ] && { echo "::error title=lru::probe of L$k hung"; fail=1; }
+            if [ -n "$evicted" ] && [ "$k" -lt "$maxe" ] && [ "${cached[$k]}" = "1" ]; then anomaly="$anomaly L$k(kept)<L$maxe(evicted)"; fi
+          done
+          {
+            echo ""
+            echo "- evicted:${evicted:- none} | kept:${kept:- none}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$anomaly" ]; then
+            echo "::error title=lru::NON-LRU eviction - newer rounds evicted while older kept:$anomaly"
+            echo "- **NON-LRU ANOMALY**:$anomaly" >> "$GITHUB_STEP_SUMMARY"
+            fail=1
+          elif [ -z "$evicted" ]; then
+            echo "- no eviction observed - raise lru_rounds x lru_bloat_gb above the per-repo cache size to force pressure." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- **PASS**: evicted rounds are the oldest prefix (LRU order holds)." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$fail"
+
+  # ===========================================================================
+  # SCENARIO: org-lru — did org-level pressure evict THIS repo's canonical?
+  # ===========================================================================
+  org_probe:
+    name: "O1 - org-lru - eviction probe after bloat"
+    needs: lru_verify
+    if: ${{ !cancelled() && (inputs.scenario == 'all' || inputs.scenario == 'org-lru') }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      # fallback allowed on purpose: if org LRU evicted us we want to OBSERVE
+      # the degraded path, not hard-fail the acquire.
+      - name: Acquire (fallback allowed)
+        id: builder
+        continue-on-error: true
+        uses: MonkCi-Inc/setup-docker-builder@v1
+      - name: Probe survival
+        run: |
+          set +e
+          hit='${{ steps.builder.outputs.cache-hit }}'
+          got=false; [ -n "${MONKCI_BUILDER:-}" ] && got=true
+          salt_state="n/a (standalone run: no lru salts to probe)"
+          if [ "${{ inputs.scenario }}" = "all" ] && [ "$got" = "true" ]; then
+            out=$(bash fault/probe.sh /tmp/o1.log --salt "lru-$RT")
+            salt_state="lru salt cached=$(grep -o 'salt_cached=[01]' <<<"$out" | cut -d= -f2)"
+          fi
+          {
+            echo "### O1 - org-lru probe"
+            echo "- got cache builder: \`$got\` | cache-hit: \`${hit:-<none>}\` | $salt_state"
+            if [ "$hit" = "true" ]; then
+              echo "- this repo's canonical SURVIVED the bloat: org-level LRU either did not trigger, or (correctly) evicted colder repos first."
+            else
+              echo "- **no cache-hit right after heavy use** - if org LRU evicted the MOST-recently-used repo, that is an org-LRU ordering bug; if quota simply forced eviction of the only bloated repo, it is expected."
+            fi
+            echo ""
+            echo "Org-wide effects (which OTHER repos were evicted, in what order) are only visible controller-side:"
+            echo '```'
+            echo "kubectl -n dev logs deploy/mig-controller | grep -Ei 'org|quota|lru|evict'"
+            echo "journalctl -u miglet | grep -Ei 'evict|quota|lru'"
+            echo '```'
+            echo "Tip: dispatch this workflow's \`lru\` scenario from SEVERAL repos in the org (oldest first), then run \`org-lru\` in the oldest repo - it should be the one evicted."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ===========================================================================
+  # SCENARIO: io-failures — ENOSPC / read-only writes, damaged blobs on reads
+  # ===========================================================================
+  io_write_fail:
+    name: "I1 - io - write failures (ENOSPC, remount-ro)"
+    needs: org_probe
+    if: ${{ !cancelled() && (inputs.scenario == 'all' || inputs.scenario == 'io-failures') }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire (nofallback)
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Seed a layer for the read-failure job (before we break writes)
+        run: |
+          set +e
+          out=$(bash fault/probe.sh /tmp/i0.log --salt "io-$RT"); rc=$?
+          set -e
+          echo "$out"; [ "$rc" -eq 0 ] || { tail -n 20 /tmp/i0.log; exit 1; }
+      - name: Fill the cache to ENOSPC and build
+        id: enospc
+        env:
+          MP: ${{ steps.builder.outputs.mount-path }}
+        run: |
+          set +e
+          [ -n "${MP:-}" ] && [ -d "$MP" ] || { echo "::error title=io::no mount-path"; exit 1; }
+          avail=$(df -B1 --output=avail "$MP" | tail -1 | tr -d ' ')
+          keep=$((16 * 1024 * 1024))
+          fill=$(( avail > keep ? avail - keep : 0 ))
+          echo "filling $fill bytes of $avail available"
+          sudo fallocate -l "$fill" "$MP/.fault-filler" || sudo dd if=/dev/zero of="$MP/.fault-filler" bs=1M count=$((fill / 1048576))
+          df -h "$MP"
+          out=$(bash fault/probe.sh /tmp/i1.log --salt "iofull-$RT" --bloat-salt fill --bloat-mb 512 --timeout 300); rc=$?
+          echo "$out"; tail -n 15 /tmp/i1.log
+          case "$rc" in
+            124) echo "verdict=HANG" >> "$GITHUB_OUTPUT"; echo "::error title=io::build HUNG on a full cache - ENOSPC must fail fast or trigger GC, never hang"; exit 1 ;;
+            0)   echo "verdict=absorbed (GC freed space)" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "verdict=failed cleanly (rc=$rc)" >> "$GITHUB_OUTPUT" ;;
+          esac
+      - name: Remove filler (always - the lease must not release ENOSPC'd)
+        if: always()
+        env:
+          MP: ${{ steps.builder.outputs.mount-path }}
+        run: |
+          [ -n "${MP:-}" ] && sudo rm -f "$MP/.fault-filler" || true
+          sync; [ -n "${MP:-}" ] && df -h "$MP" || true
+      - name: Build again in-place (must recover without a new lease)
+        run: |
+          set +e
+          out=$(bash fault/probe.sh /tmp/i2.log --salt "ioafter-$RT" --timeout 600); rc=$?
+          set -e
+          echo "$out"
+          [ "$rc" -eq 0 ] || { tail -n 20 /tmp/i2.log; echo "::error title=io::build still failing after space was freed - lease wedged by transient ENOSPC"; exit 1; }
+      - name: Read-only remount attempt
+        id: ro
+        env:
+          MP: ${{ steps.builder.outputs.mount-path }}
+        run: |
+          set +e
+          if sudo mount -o remount,ro "$MP" 2>/dev/null; then
+            out=$(bash fault/probe.sh /tmp/i3.log --salt "ioro-$RT" --timeout 300); rc=$?
+            sudo mount -o remount,rw "$MP"
+            if [ "$rc" -eq 124 ]; then echo "verdict=HANG" >> "$GITHUB_OUTPUT"; echo "::error title=io::build HUNG on a read-only cache"; exit 1; fi
+            [ "$rc" -eq 0 ] && echo "verdict=unexpectedly succeeded" >> "$GITHUB_OUTPUT" || echo "verdict=failed cleanly (rc=$rc)" >> "$GITHUB_OUTPUT"
+            out=$(bash fault/probe.sh /tmp/i4.log --salt "iorw-$RT" --timeout 600); rc=$?
+            [ "$rc" -eq 0 ] || { echo "::error title=io::build broken after remount-rw"; exit 1; }
+          else
+            echo "verdict=remount-ro skipped (EBUSY - BuildKit holds write fds; expected)" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### I1 - io write failures"
+            echo "- ENOSPC build: **${{ steps.enospc.outputs.verdict }}** (hang = bug; clean failure or GC = ok)"
+            echo "- in-place recovery after freeing space: see step outcome"
+            echo "- remount-ro: ${{ steps.ro.outputs.verdict }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  io_read_fail:
+    name: "I2 - io - read failures (damaged content blobs)"
+    needs: io_write_fail
+    if: ${{ !cancelled() && (inputs.scenario == 'all' || inputs.scenario == 'io-failures') }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire (nofallback)
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Damage content blobs (DBs untouched), then rebuild a cached salt
+        id: damage
+        env:
+          MP: ${{ steps.builder.outputs.mount-path }}
+        run: |
+          set +e
+          [ -n "${MP:-}" ] && [ -d "$MP" ] || { echo "::error title=io::no mount-path"; exit 1; }
+          # Confirm the salt seeded in I1 is visible before we damage anything.
+          out=$(bash fault/probe.sh /tmp/r0.log --salt "io-$RT"); pre=$(grep -o 'salt_cached=[01]' <<<"$out" | cut -d= -f2)
+          echo "pre_cached=$pre" >> "$GITHUB_OUTPUT"
+          # Damage: overwrite 8 content files in place, delete 8 more. DBs and
+          # the clean-shutdown marker are NOT touched - this is read-path
+          # damage, not metadata corruption (corrupt-recover covers that).
+          mapfile -t files < <(sudo find "$MP" -xdev -type f -size +512k ! -name '*.db' ! -name '.monkci*' 2>/dev/null | head -16)
+          echo "damaging ${#files[@]} files"
+          n=0
+          for f in "${files[@]}"; do
+            n=$((n+1))
+            if [ $((n % 2)) -eq 0 ]; then sudo rm -f "$f"
+            else sudo dd if=/dev/urandom of="$f" bs=512K count=1 conv=notrunc status=none; fi
+          done
+          # Restart BuildKit so damaged content can't be served from memory.
+          BKC=$(docker ps --format '{{.Names}} {{.Image}}' | grep -iE 'buildkit|moby' | awk '{print $1}' | head -1)
+          [ -n "${BKC:-}" ] && sudo docker restart "$BKC" && sleep 5
+          out=$(bash fault/probe.sh /tmp/r1.log --salt "io-$RT" --timeout 600); rc=$?
+          echo "$out"; tail -n 15 /tmp/r1.log
+          case "$rc" in
+            124) echo "verdict=HANG" >> "$GITHUB_OUTPUT"; echo "::error title=io::build HUNG reading damaged cache content"; exit 1 ;;
+            0)   echo "verdict=tolerated (rebuilt or served intact copies)" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "verdict=failed rc=$rc (hard failure on damaged reads - next job must prove recovery)" >> "$GITHUB_OUTPUT" ;;
+          esac
+          exit 0
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### I2 - io read failures"
+            echo "- salt cached before damage: \`${{ steps.damage.outputs.pre_cached }}\` (want 1)"
+            echo "- rebuild over damaged blobs: **${{ steps.damage.outputs.verdict }}** (only HANG fails this job)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  io_recover:
+    name: "I3 - io - fresh acquire must still build"
+    needs: io_read_fail
+    if: ${{ !cancelled() && (inputs.scenario == 'all' || inputs.scenario == 'io-failures') }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire (fallback allowed)
+        id: builder
+        continue-on-error: true
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'false'
+      - name: Build MUST succeed (cache or fallback), no hang
+        id: build
+        run: |
+          set +e
+          if [ -n "${MONKCI_BUILDER:-}" ]; then B="$MONKCI_BUILDER"; else
+            B=local-fallback
+            docker buildx inspect "$B" >/dev/null 2>&1 || docker buildx create --name "$B" --driver docker-container >/dev/null
+            echo "::warning title=io::cache unavailable after IO damage - on local fallback"
+          fi
+          echo "builder=$B" >> "$GITHUB_OUTPUT"
+          out=$(bash fault/probe.sh /tmp/i9.log --salt "iorec-$RT" --builder "$B" --timeout 600); rc=$?
+          echo "$out"
+          [ "$rc" -eq 124 ] && { echo "::error title=io::build HUNG after IO damage"; exit 1; }
+          [ "$rc" -eq 0 ] || { tail -n 20 /tmp/i9.log; echo "::error title=io::build failed after IO damage - no working path left"; exit 1; }
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### I3 - io recovery"
+            echo "- setup outcome: \`${{ steps.builder.outcome }}\` | builder used: \`${{ steps.build.outputs.builder }}\`"
+            echo "- **PASS** = after write+read fault injection, a fresh job still builds (cache healed or clean fallback), with no hang."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ===========================================================================
+  # SCENARIO: corrupt-recover — metadata corruption, quarantine, full heal
+  # ===========================================================================
+  cor_corrupt:
+    name: "C1 - corrupt - delete BuildKit DBs uncleanly"
+    needs: io_recover
+    if: ${{ !cancelled() && (inputs.scenario == 'all' || inputs.scenario == 'corrupt-recover') }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire (nofallback)
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Populate state, then corrupt
+        env:
+          MP: ${{ steps.builder.outputs.mount-path }}
+        run: |
+          set +e
+          bash fault/probe.sh /tmp/c1.log --salt "cor-$RT" >/dev/null
+          [ -n "${MP:-}" ] && [ -d "$MP" ] || { echo "::error title=corrupt::no mount-path"; exit 1; }
+          BKC=$(docker ps --format '{{.Names}} {{.Image}}' | grep -iE 'buildkit|moby' | awk '{print $1}' | head -1)
+          [ -n "${BKC:-}" ] && sudo docker stop -t 5 "$BKC"
+          sudo rm -f "$MP/.monkci-clean-shutdown"
+          sudo find "$MP" -xdev -type f \
+            \( -name cache.db -o -name history.db -o -name metadata.db \
+               -o -name metadata_v2.db -o -name containerdmeta.db \) -delete
+          echo "snapshot dirs kept:"; sudo find "$MP" -xdev -maxdepth 2 -type d -name 'runc-*' -print || true
+      - name: Summary
+        if: always()
+        run: |
+          echo "### C1 - corrupt: BuildKit stopped (unclean release), marker removed, DBs deleted, snapshot dirs kept. Preflight must detect this." >> "$GITHUB_STEP_SUMMARY"
+
+  cor_recover:
+    name: "C2 - corrupt - acquire must not hang, build must pass"
+    needs: cor_corrupt
+    if: ${{ !cancelled() && (inputs.scenario == 'all' || inputs.scenario == 'corrupt-recover') }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire (fallback allowed)
+        id: builder
+        continue-on-error: true
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'false'
+      - name: Build MUST succeed
+        id: build
+        run: |
+          set +e
+          if [ -n "${MONKCI_BUILDER:-}" ]; then B="$MONKCI_BUILDER"; else
+            B=local-fallback
+            docker buildx inspect "$B" >/dev/null 2>&1 || docker buildx create --name "$B" --driver docker-container >/dev/null
+            echo "::warning title=corrupt::cache unavailable - on local fallback"
+          fi
+          echo "builder=$B" >> "$GITHUB_OUTPUT"
+          out=$(bash fault/probe.sh /tmp/c2.log --salt "crec-$RT" --builder "$B" --timeout 600); rc=$?
+          echo "$out"
+          [ "$rc" -eq 0 ] || { tail -n 20 /tmp/c2.log; echo "::error title=corrupt::build failed after corruption"; exit 1; }
+      - name: Summary
+        if: always()
+        run: |
+          used='${{ steps.build.outputs.builder }}'
+          path="reformat/reset recovery"; [ "$used" = "local-fallback" ] && path="local fallback (service degraded/poisoned)"
+          {
+            echo "### C2 - recover"
+            echo "- setup: \`${{ steps.builder.outcome }}\` | builder: \`$used\` | inferred path: **$path**"
+            echo "- **PASS** = acquire returned (no hang) and the build succeeded."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  cor_rebuild:
+    name: "C3 - corrupt - fresh canonical after reset"
+    needs: cor_recover
+    if: ${{ !cancelled() && (inputs.scenario == 'all' || inputs.scenario == 'corrupt-recover') }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Wait for controller reset to converge
+        run: sleep 90
+      - name: Acquire (nofallback)
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Warm the fresh canonical (cold is EXPECTED)
+        run: |
+          set +e
+          out=$(bash fault/probe.sh /tmp/c3.log --salt "cnew-$RT" --timeout 600); rc=$?
+          set -e
+          echo "$out"; [ "$rc" -eq 0 ] || { tail -n 20 /tmp/c3.log; exit 1; }
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### C3 - rebuild"
+            echo "- cache-hit: \`${{ steps.builder.outputs.cache-hit }}\` (false is EXPECTED right after quarantine+reset)"
+            echo "- **PASS** = a fresh canonical was acquirable and warmed."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  cor_rehit:
+    name: "C4 - corrupt - warm again"
+    needs: cor_rebuild
+    if: ${{ !cancelled() && (inputs.scenario == 'all' || inputs.scenario == 'corrupt-recover') }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Acquire (nofallback)
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Assert healed + warm
+        run: |
+          set +e
+          out=$(bash fault/probe.sh /tmp/c4.log --salt "cnew-$RT"); rc=$?
+          set -e
+          echo "$out"
+          fail=0
+          [ "${{ steps.builder.outputs.cache-hit }}" = "true" ] || { echo "::error title=corrupt::expected cache-hit=true after rebuild"; fail=1; }
+          grep -q 'salt_cached=1' <<<"$out" || { echo "::error title=corrupt::cache did not heal - C3's layer not CACHED"; fail=1; }
+          exit "$fail"
+      - name: Summary
+        if: always()
+        run: |
+          echo "### C4 - re-hit: full cycle proven - corrupt -> detect -> quarantine/reset -> rebuild -> warm again." >> "$GITHUB_STEP_SUMMARY"
+
+  # ===========================================================================
+  # OUTCOMES — one table telling you which failures indicate cache bugs
+  # ===========================================================================
+  outcomes:
+    name: "Z - outcomes"
+    needs: [write_seed, write_verify, lastgood_seed, lastgood_dirty, lastgood_check, lastgood_advance, par_seed, par_fan, par_verify, lru_churn, lru_verify, org_probe, io_write_fail, io_read_fail, io_recover, cor_corrupt, cor_recover, cor_rebuild, cor_rehit]
+    if: ${{ always() }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5
+    steps:
+      - name: Render outcome matrix
+        run: |
+          {
+            echo "## Fault matrix - outcomes (scenario: \`${{ inputs.scenario }}\`, run tag \`$RT\`)"
+            echo ""
+            echo "| scenario | job | result | a failure here means |"
+            echo "|---|---|---|---|"
+            echo "| cache-write | W1 seed | ${{ needs.write_seed.result }} | infra: could not even build on the cache |"
+            echo "| cache-write | W2 read-back | ${{ needs.write_verify.result }} | **BUG: cache write / snapshot publish / read-back broken** |"
+            echo "| lastgood | L1 seed A | ${{ needs.lastgood_seed.result }} | infra |"
+            echo "| lastgood | L2 dirty crash | ${{ needs.lastgood_dirty.result }} | infra: crash injection failed |"
+            echo "| lastgood | L3 A kept, B discarded | ${{ needs.lastgood_check.result }} | **BUG: crash lost last-good, or dirty write got published** |"
+            echo "| lastgood | L4 clean advance | ${{ needs.lastgood_advance.result }} | **BUG: clean release did not advance last-good** |"
+            echo "| parallel | P1 seed | ${{ needs.par_seed.result }} | infra |"
+            echo "| parallel | P2 fan x8 | ${{ needs.par_fan.result }} | acquire/build failed under contention |"
+            echo "| parallel | P3 isolation + single writer | ${{ needs.par_verify.result }} | **BUG: shared reads, clone isolation, or writer-lease exclusivity** |"
+            echo "| lru | R1 churn | ${{ needs.lru_churn.result }} | **BUG if HANG; warning-only for ENOSPC rounds** |"
+            echo "| lru | R2 eviction order | ${{ needs.lru_verify.result }} | **BUG: non-LRU eviction (newer evicted before older)** |"
+            echo "| org-lru | O1 probe | ${{ needs.org_probe.result }} | see job summary (needs controller-side confirmation) |"
+            echo "| io-failures | I1 write faults | ${{ needs.io_write_fail.result }} | **BUG: hang on ENOSPC/ro, or wedged after space freed** |"
+            echo "| io-failures | I2 read faults | ${{ needs.io_read_fail.result }} | **BUG: hang reading damaged blobs** |"
+            echo "| io-failures | I3 recovery | ${{ needs.io_recover.result }} | **BUG: no working build path after IO damage** |"
+            echo "| corrupt-recover | C1 corrupt | ${{ needs.cor_corrupt.result }} | infra: corruption injection failed |"
+            echo "| corrupt-recover | C2 recover | ${{ needs.cor_recover.result }} | **BUG: acquire hung or build failed on corrupted cache** |"
+            echo "| corrupt-recover | C3 fresh canonical | ${{ needs.cor_rebuild.result }} | **BUG: no fresh canonical after controller reset** |"
+            echo "| corrupt-recover | C4 warm again | ${{ needs.cor_rehit.result }} | **BUG: cache never healed back to warm** |"
+            echo ""
+            echo "\`skipped\` = scenario not selected. Jobs marked *infra* failing usually invalidate the checks downstream of them - read those results with that in mind."
+          } >> "$GITHUB_STEP_SUMMARY"
