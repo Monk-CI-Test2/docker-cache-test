@@ -383,7 +383,7 @@ jobs:
           echo "r${{ matrix.job }}=$line" >> "$GITHUB_OUTPUT"
 
   par_verify:
-    name: "P3 - parallel - isolation + single-writer verdict"
+    name: "P3 - parallel - isolation + role-attributed persistence"
     needs: par_fan
     if: ${{ !cancelled() && (inputs.scenario == 'all' || inputs.scenario == 'parallel') }}
     runs-on: ${{ inputs.runner }}
@@ -406,7 +406,7 @@ jobs:
             echo "| job | got builder | cache-hit | role | setup (ms) | shared CACHED (want 1) | uniq 1st (want 0) | uniq 2nd (want 1) |"
             echo "|---|---|---|---|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
-          fail=0; n=0; ok_shared=0; ok_iso=0; ok_write=0; hits=0
+          fail=0; n=0; ok_shared=0; ok_iso=0; ok_write=0; hits=0; unknown=0
           declare -A role_of
           writers=""; clones=""
           while IFS= read -r line; do
@@ -415,8 +415,11 @@ jobs:
             declare $line
             n=$((n+1))
             role_of[$job]="$cache_role"
-            [ "$cache_role" = "canonical_writer" ] && writers="$writers $job"
-            [ "$cache_role" = "disposable_clone" ] && clones="$clones $job"
+            case "$cache_role" in
+              canonical_writer) writers="$writers $job" ;;
+              disposable_clone) clones="$clones $job" ;;
+              *) unknown=$((unknown+1)) ;;
+            esac
             [ "$cache_hit" = "true" ] && hits=$((hits+1))
             [ "$shared_cached" = "1" ] && ok_shared=$((ok_shared+1))
             [ "$uniq_first" = "0" ] && ok_iso=$((ok_iso+1))
@@ -427,13 +430,21 @@ jobs:
           [ "$ok_shared" -eq "$n" ] || { echo "::error title=parallel::$((n-ok_shared)) job(s) did NOT see the shared layer CACHED - parallel snapshot reads broken"; fail=1; }
           [ "$ok_iso" -eq "$n" ] || { echo "::error title=parallel::a brand-new unique salt was already CACHED - cross-clone bleed or key collision"; fail=1; }
           [ "$ok_write" -eq "$n" ] || { echo "::error title=parallel::$((n-ok_write)) clone(s) not writable in-job"; fail=1; }
+          # SETUP GATE: without usable role provenance the scenario cannot
+          # prove its central invariant (no clone write persists), and nw=0
+          # would silently skip the zero-persistence check too. Stale agents
+          # without the cache-role output were central to the incident.
+          if [ "$unknown" -gt 0 ]; then
+            echo "::error title=parallel::SETUP INVALID - $unknown fan job(s) reported no usable cache-role (stale agent without the output?); clone-write persistence cannot be attributed. Deploy agents with cache-role support before judging this scenario."; fail=1
+          fi
           # Writer-lock exclusivity is one writer AT A TIME, not one per
           # fan-out: staggered jobs legitimately acquire the writer lease
           # sequentially, and each clean sequential writer may publish. The
           # assertions are therefore:
           #   * no disposable clone's unique layer may persist (clone writes
           #     are discarded by design), attributed via the cache-role output;
-          #   * >=1 writer with 0 persisted layers = publication broken;
+          #   * >=1 writer with 0 persisted layers = WARNING + ledger pointer
+          #     (the workflow cannot see release_clean/deferral state - §4.7);
           #   * interval-overlap is a one-time OUT-OF-BAND ledger check (the
           #     writer-lock Lua enforces exclusivity structurally).
           persisted=0; who=""
