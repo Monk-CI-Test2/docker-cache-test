@@ -457,7 +457,14 @@ jobs:
             echo "- unique layers persisted into last-good: **$persisted** (jobs:${who:- none}) - each must belong to a writer-role job; count may legitimately exceed 1 (sequential writers)"
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$persisted" -eq 0 ] && [ "$nw" -ge 1 ]; then
-            echo "::error title=parallel::$nw fan job(s) held the writer lease but NO unique layer persisted - clean writer releases are not advancing last-good (the 30245314397 incident signature)"; fail=1
+            # WARNING, not failure: cache-role proves these jobs held the
+            # writer lease, but the workflow cannot see release_clean or
+            # publication state - a writer's publication can legitimately be
+            # DEFERRED on snapshot-lock contention. Whether writers actually
+            # published is a ledger assertion (docker_cache:lease:* for this
+            # run_id: release_clean + snapshot_publish_state), per plan 4.7.
+            echo "::warning title=parallel::$nw writer-role fan job(s) but no unique layer persisted - verify release_clean/snapshot_publish_state in the lease ledger (incident signature IF the ledger shows clean+published; benign if deferred)"
+            echo "- **verify out-of-band**: 0 persisted with $nw writer(s) - check the lease ledger before calling this a bug." >> "$GITHUB_STEP_SUMMARY"
           fi
           exit "$fail"
 
