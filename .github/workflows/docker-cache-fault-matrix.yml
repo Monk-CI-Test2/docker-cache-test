@@ -105,7 +105,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@v1
+        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
         with:
           nofallback: 'true'
       - name: Build unique salted layer (must WRITE the cache)
@@ -135,7 +135,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@v1
+        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
         with:
           nofallback: 'true'
       - name: Assert the seeded layer is CACHED here
@@ -171,7 +171,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@v1
+        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
         with:
           nofallback: 'true'
       - name: Build salt A
@@ -196,7 +196,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@v1
+        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
         with:
           nofallback: 'true'
       - name: Build salt B, then simulate a crash before release
@@ -219,10 +219,16 @@ jobs:
           # (unclean release, no snapshot publish) and remove the clean-shutdown
           # marker so the next acquire reads a crash. DBs are LEFT INTACT - this
           # is a crash, not corruption (corrupt-recover covers that).
+          # Every injection step HARD-FAILS: if the crash is not actually
+          # injected, L3 tests nothing while looking cleanly attributable
+          # (run 30303821903 plan section 0).
           BKC=$(docker ps --format '{{.Names}} {{.Image}}' | grep -iE 'buildkit|moby' | awk '{print $1}' | head -1)
-          if [ -n "${BKC:-}" ]; then echo "stopping BuildKit: $BKC"; sudo docker stop -t 5 "$BKC" || true
-          else echo "::warning title=lastgood::no BuildKit container found to stop"; fi
-          [ -n "${MP:-}" ] && sudo rm -f "$MP/.monkci-clean-shutdown" || true
+          [ -n "${BKC:-}" ] || { echo "::error title=lastgood::INJECTION INVALID - no BuildKit container found to stop; L3 would test nothing"; exit 1; }
+          echo "stopping BuildKit: $BKC"
+          sudo docker stop -t 5 "$BKC" || { echo "::error title=lastgood::INJECTION INVALID - docker stop $BKC failed"; exit 1; }
+          [ -n "${MP:-}" ] || { echo "::error title=lastgood::INJECTION INVALID - no mount-path; cannot remove the clean-shutdown marker"; exit 1; }
+          sudo rm -f "$MP/.monkci-clean-shutdown" || { echo "::error title=lastgood::INJECTION INVALID - marker removal failed"; exit 1; }
+          [ ! -e "$MP/.monkci-clean-shutdown" ] || { echo "::error title=lastgood::INJECTION INVALID - marker still present after removal"; exit 1; }
       - name: Summary
         if: always()
         run: |
@@ -238,7 +244,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@v1
+        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
         with:
           nofallback: 'true'
       - name: Assert last-good semantics after the crash
@@ -279,7 +285,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@v1
+        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
         with:
           nofallback: 'true'
       - name: Assert B (rebuilt cleanly in L3) is now in last-good
@@ -314,7 +320,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@v1
+        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
         with:
           nofallback: 'true'
       - name: Build the shared layer every parallel job must see
@@ -360,7 +366,7 @@ jobs:
       - name: Acquire (nofallback)
         id: builder
         continue-on-error: true
-        uses: MonkCi-Inc/setup-docker-builder@v1
+        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
         with:
           nofallback: 'true'
       - name: Probe shared read + isolated write on this clone
@@ -392,7 +398,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@v1
+        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
         with:
           nofallback: 'true'
       - name: Verdict
@@ -492,7 +498,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@v1
+        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
         with:
           nofallback: 'true'
       - name: Build unique multi-GiB layers round after round
@@ -534,7 +540,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@v1
+        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
         with:
           nofallback: 'true'
       - name: Probe every round, newest -> oldest
@@ -619,7 +625,7 @@ jobs:
       - name: Acquire (fallback allowed)
         id: builder
         continue-on-error: true
-        uses: MonkCi-Inc/setup-docker-builder@v1
+        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
       - name: Probe survival
         run: |
           set +e
@@ -660,7 +666,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@v1
+        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
         with:
           nofallback: 'true'
       - name: Seed a layer for the read-failure job (before we break writes)
@@ -739,7 +745,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@v1
+        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
         with:
           nofallback: 'true'
       - name: Damage content blobs (DBs untouched), then rebuild a cached salt
@@ -752,11 +758,26 @@ jobs:
           # Confirm the salt seeded in I1 is visible before we damage anything.
           out=$(bash fault/probe.sh /tmp/r0.log --salt "io-$RT"); pre=$(grep -o 'salt_cached=[01]' <<<"$out" | cut -d= -f2)
           echo "pre_cached=$pre" >> "$GITHUB_OUTPUT"
-          # Damage: overwrite 8 content files in place, delete 8 more. DBs and
+          # Damage: overwrite half in place, delete the other half. DBs and
           # the clean-shutdown marker are NOT touched - this is read-path
           # damage, not metadata corruption (corrupt-recover covers that).
+          # Deterministic + attributed (run 30303821903 plan section 0): the
+          # 2026-07-27 run damaged 10 arbitrary files labeled "content blobs"
+          # without proof. Require a minimum victim count and report per-path
+          # categories so the verdict names what was actually damaged.
           mapfile -t files < <(sudo find "$MP" -xdev -type f -size +512k ! -name '*.db' ! -name '.monkci*' 2>/dev/null | head -16)
-          echo "damaging ${#files[@]} files"
+          [ "${#files[@]}" -ge 4 ] || { echo "::error title=io::INJECTION INVALID - only ${#files[@]} candidate files >512k under $MP (need >=4); damage would be a no-op"; exit 1; }
+          content=0; snap=0; other=0
+          for f in "${files[@]}"; do
+            case "$f" in
+              */content/*)   content=$((content+1)) ;;
+              */snapshots/*) snap=$((snap+1)) ;;
+              *)             other=$((other+1)) ;;
+            esac
+          done
+          echo "damaging ${#files[@]} files (content-store=$content snapshot=$snap other=$other)"
+          echo "damage_total=${#files[@]}" >> "$GITHUB_OUTPUT"
+          echo "damage_categories=content=$content snapshot=$snap other=$other" >> "$GITHUB_OUTPUT"
           n=0
           for f in "${files[@]}"; do
             n=$((n+1))
@@ -764,8 +785,11 @@ jobs:
             else sudo dd if=/dev/urandom of="$f" bs=512K count=1 conv=notrunc status=none; fi
           done
           # Restart BuildKit so damaged content can't be served from memory.
+          # A missing container is an injection failure, not a shrug: damaged
+          # bytes served from memory would fake an "intact" I2.
           BKC=$(docker ps --format '{{.Names}} {{.Image}}' | grep -iE 'buildkit|moby' | awk '{print $1}' | head -1)
-          [ -n "${BKC:-}" ] && sudo docker restart "$BKC" && sleep 5
+          [ -n "${BKC:-}" ] || { echo "::error title=io::INJECTION INVALID - no BuildKit container to restart; damaged content could be served from memory"; exit 1; }
+          sudo docker restart "$BKC" && sleep 5
           out=$(bash fault/probe.sh /tmp/r1.log --salt "io-$RT" --timeout 600); rc=$?
           echo "$out"; tail -n 15 /tmp/r1.log
           case "$rc" in
@@ -780,6 +804,7 @@ jobs:
           {
             echo "### I2 - io read failures"
             echo "- salt cached before damage: \`${{ steps.damage.outputs.pre_cached }}\` (want 1)"
+            echo "- damaged: \`${{ steps.damage.outputs.damage_total }}\` files (\`${{ steps.damage.outputs.damage_categories }}\`)"
             echo "- rebuild over damaged blobs: **${{ steps.damage.outputs.verdict }}** (only HANG fails this job)"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -794,7 +819,7 @@ jobs:
       - name: Acquire (fallback allowed)
         id: builder
         continue-on-error: true
-        uses: MonkCi-Inc/setup-docker-builder@v1
+        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
         with:
           nofallback: 'false'
       - name: Build MUST succeed (cache or fallback), no hang
@@ -833,7 +858,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@v1
+        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
         with:
           nofallback: 'true'
       - name: Populate state, then corrupt
@@ -866,7 +891,7 @@ jobs:
       - name: Acquire (fallback allowed)
         id: builder
         continue-on-error: true
-        uses: MonkCi-Inc/setup-docker-builder@v1
+        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
         with:
           nofallback: 'false'
       - name: Build MUST succeed
@@ -905,7 +930,7 @@ jobs:
         run: sleep 90
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@v1
+        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
         with:
           nofallback: 'true'
       - name: Warm the fresh canonical (cold is EXPECTED)
@@ -933,7 +958,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@v1
+        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
         with:
           nofallback: 'true'
       - name: Assert healed + warm
