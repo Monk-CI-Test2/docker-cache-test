@@ -105,7 +105,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
+        uses: MonkCi-Inc/setup-docker-builder@d5c0a8b6a0e59a9662c899626b5653076748716c # v1.0.2 (bundle = miglet 34c11e0)
         with:
           nofallback: 'true'
       - name: Build unique salted layer (must WRITE the cache)
@@ -135,7 +135,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
+        uses: MonkCi-Inc/setup-docker-builder@d5c0a8b6a0e59a9662c899626b5653076748716c # v1.0.2 (bundle = miglet 34c11e0)
         with:
           nofallback: 'true'
       - name: Assert the seeded layer is CACHED here
@@ -171,7 +171,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
+        uses: MonkCi-Inc/setup-docker-builder@d5c0a8b6a0e59a9662c899626b5653076748716c # v1.0.2 (bundle = miglet 34c11e0)
         with:
           nofallback: 'true'
       - name: Build salt A
@@ -196,7 +196,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
+        uses: MonkCi-Inc/setup-docker-builder@d5c0a8b6a0e59a9662c899626b5653076748716c # v1.0.2 (bundle = miglet 34c11e0)
         with:
           nofallback: 'true'
       - name: Build salt B, then simulate a crash before release
@@ -244,7 +244,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
+        uses: MonkCi-Inc/setup-docker-builder@d5c0a8b6a0e59a9662c899626b5653076748716c # v1.0.2 (bundle = miglet 34c11e0)
         with:
           nofallback: 'true'
       - name: Assert last-good semantics after the crash
@@ -285,7 +285,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
+        uses: MonkCi-Inc/setup-docker-builder@d5c0a8b6a0e59a9662c899626b5653076748716c # v1.0.2 (bundle = miglet 34c11e0)
         with:
           nofallback: 'true'
       - name: Assert B (rebuilt cleanly in L3) is now in last-good
@@ -320,7 +320,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
+        uses: MonkCi-Inc/setup-docker-builder@d5c0a8b6a0e59a9662c899626b5653076748716c # v1.0.2 (bundle = miglet 34c11e0)
         with:
           nofallback: 'true'
       - name: Build the shared layer every parallel job must see
@@ -366,7 +366,7 @@ jobs:
       - name: Acquire (nofallback)
         id: builder
         continue-on-error: true
-        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
+        uses: MonkCi-Inc/setup-docker-builder@d5c0a8b6a0e59a9662c899626b5653076748716c # v1.0.2 (bundle = miglet 34c11e0)
         with:
           nofallback: 'true'
       - name: Probe shared read + isolated write on this clone
@@ -398,7 +398,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
+        uses: MonkCi-Inc/setup-docker-builder@d5c0a8b6a0e59a9662c899626b5653076748716c # v1.0.2 (bundle = miglet 34c11e0)
         with:
           nofallback: 'true'
       - name: Verdict
@@ -498,7 +498,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
+        uses: MonkCi-Inc/setup-docker-builder@d5c0a8b6a0e59a9662c899626b5653076748716c # v1.0.2 (bundle = miglet 34c11e0)
         with:
           nofallback: 'true'
       - name: Build unique multi-GiB layers round after round
@@ -540,7 +540,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
+        uses: MonkCi-Inc/setup-docker-builder@d5c0a8b6a0e59a9662c899626b5653076748716c # v1.0.2 (bundle = miglet 34c11e0)
         with:
           nofallback: 'true'
       - name: Probe every round, newest -> oldest
@@ -625,7 +625,7 @@ jobs:
       - name: Acquire (fallback allowed)
         id: builder
         continue-on-error: true
-        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
+        uses: MonkCi-Inc/setup-docker-builder@d5c0a8b6a0e59a9662c899626b5653076748716c # v1.0.2 (bundle = miglet 34c11e0)
       - name: Probe survival
         run: |
           set +e
@@ -666,7 +666,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
+        uses: MonkCi-Inc/setup-docker-builder@d5c0a8b6a0e59a9662c899626b5653076748716c # v1.0.2 (bundle = miglet 34c11e0)
         with:
           nofallback: 'true'
       - name: Seed a layer for the read-failure job (before we break writes)
@@ -745,7 +745,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
+        uses: MonkCi-Inc/setup-docker-builder@d5c0a8b6a0e59a9662c899626b5653076748716c # v1.0.2 (bundle = miglet 34c11e0)
         with:
           nofallback: 'true'
       - name: Damage content blobs (DBs untouched), then rebuild a cached salt
@@ -819,7 +819,7 @@ jobs:
       - name: Acquire (fallback allowed)
         id: builder
         continue-on-error: true
-        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
+        uses: MonkCi-Inc/setup-docker-builder@d5c0a8b6a0e59a9662c899626b5653076748716c # v1.0.2 (bundle = miglet 34c11e0)
         with:
           nofallback: 'false'
       - name: Build MUST succeed (cache or fallback), no hang
@@ -858,7 +858,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
+        uses: MonkCi-Inc/setup-docker-builder@d5c0a8b6a0e59a9662c899626b5653076748716c # v1.0.2 (bundle = miglet 34c11e0)
         with:
           nofallback: 'true'
       - name: Populate state, then corrupt
@@ -891,7 +891,7 @@ jobs:
       - name: Acquire (fallback allowed)
         id: builder
         continue-on-error: true
-        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
+        uses: MonkCi-Inc/setup-docker-builder@d5c0a8b6a0e59a9662c899626b5653076748716c # v1.0.2 (bundle = miglet 34c11e0)
         with:
           nofallback: 'false'
       - name: Build MUST succeed
@@ -930,7 +930,7 @@ jobs:
         run: sleep 90
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
+        uses: MonkCi-Inc/setup-docker-builder@d5c0a8b6a0e59a9662c899626b5653076748716c # v1.0.2 (bundle = miglet 34c11e0)
         with:
           nofallback: 'true'
       - name: Warm the fresh canonical (cold is EXPECTED)
@@ -958,7 +958,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Acquire (nofallback)
         id: builder
-        uses: MonkCi-Inc/setup-docker-builder@4922bc8a93bf27fe6ed0623ed40e3385dfa77a0b # v1.0.1 (bundle = miglet 8366dcd)
+        uses: MonkCi-Inc/setup-docker-builder@d5c0a8b6a0e59a9662c899626b5653076748716c # v1.0.2 (bundle = miglet 34c11e0)
         with:
           nofallback: 'true'
       - name: Assert healed + warm
