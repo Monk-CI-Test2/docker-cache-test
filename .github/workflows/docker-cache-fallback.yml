@@ -1,0 +1,59 @@
+name: Docker Cache — denial → local-fallback (build must stay green)
+
+# §3.3: with nofallback UNSET, an entitlement denial must degrade silently —
+# no MONKCI_BUILDER, the job builds on a local ephemeral builder and stays
+# green. The initial sleep gives an operator time to flip the org's
+# subscription state in SQL so the acquire (10s entitlement TTL) is denied.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pre_setup_sleep_seconds:
+        description: "Sleep before 'Set up Docker builder' (operator flips SQL state during this)"
+        default: "45"
+        type: string
+      runner:
+        description: "Runner"
+        default: "monkci-ubuntu-24.04-4"
+        type: choice
+        options:
+          - "monkci-ubuntu-24.04-4"
+          - "monkci-ubuntu-24.04-2"
+
+permissions:
+  contents: read
+
+jobs:
+  fallback:
+    name: denial fallback
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    steps:
+      - name: Generate tiny build context
+        run: |
+          mkdir -p ctx
+          printf 'FROM alpine:3.20\nRUN echo fallback-test > /x\nRUN cat /x\n' > ctx/Dockerfile
+      - name: Wait for operator SQL flip
+        run: sleep ${{ inputs.pre_setup_sleep_seconds }}
+      - name: Set up Docker builder (fallback allowed)
+        id: builder
+        continue-on-error: true
+        uses: MonkCi-Inc/setup-docker-builder@v1
+      - name: Build must succeed (locally if denied)
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${MONKCI_BUILDER:-}" ]; then
+            B="$MONKCI_BUILDER"; USED=cache
+          else
+            B=local-fallback; USED=local
+            docker buildx inspect "$B" >/dev/null 2>&1 || docker buildx create --name "$B" --driver docker-container >/dev/null
+            echo "::warning::cache unavailable — building on local fallback"
+          fi
+          docker buildx build --builder "$B" --output type=cacheonly --progress plain ctx
+          echo "used=$USED" >> "$GITHUB_OUTPUT"
+      - name: Report path taken
+        run: |
+          echo "builder path: ${{ steps.build.outputs.used }} (setup outcome: ${{ steps.builder.outcome }})"
+          [ "${{ steps.build.outputs.used }}" = "local" ] && echo "DENIAL-FALLBACK: build stayed green on local builder" || echo "CACHE PATH: acquire was granted (no denial active)"
