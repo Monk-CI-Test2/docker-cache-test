@@ -22,6 +22,10 @@ on:
         description: "Expected repo_gc_budget_bytes for this acquire"
         required: true
         type: string
+      pre_budget_sleep_seconds:
+        description: "Sleep before the budget acquire (lets an operator flip SQL state mid-job)"
+        default: "0"
+        type: string
       runner:
         description: "Runner"
         default: "monkci-ubuntu-24.04-4"
@@ -61,6 +65,9 @@ jobs:
           echo "$RESP" | grep -q 'miglet_budget_capability_required' || { echo "::error::expected miglet_budget_capability_required, got: $RESP"; exit 1; }
           echo "$RESP" | grep -q '"cache_enabled":true' && { echo "::error::legacy miglet was GRANTED a capped lease"; exit 1; }
           echo "PASS: pre-budget miglet denied (safe local fallback)"
+      - name: Optional wait before budget acquire
+        if: ${{ inputs.pre_budget_sleep_seconds != '0' }}
+        run: sleep ${{ inputs.pre_budget_sleep_seconds }}
       - name: Full-capability acquire must carry the remainder/floor budget
         id: budget
         shell: bash
