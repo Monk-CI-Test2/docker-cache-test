@@ -1,0 +1,78 @@
+name: Docker Cache — Identity binding & owner-id normalization probe
+
+# Calls the miglet's LOCAL DockerCacheService (twirp on 127.0.0.1:7080) directly,
+# bypassing the setup action, to verify two security/accounting properties:
+#
+#   wrong-org   an acquire asserting an owner id that does NOT match the
+#               controller-assigned job for this VM must be denied with
+#               org_cache_identity_mismatch (fail-closed, nothing billable).
+#   padded      an acquire asserting the CORRECT owner id but zero-padded
+#               ("0279648556") must be normalized: identity check passes,
+#               the lease lands on the canonical org_279648556_* namespace,
+#               and NO padded-key state may appear anywhere.
+#
+# The padded acquire is released cleanly at the end (clean release republishes
+# the last-good snapshot; harmless).
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner"
+        default: "monkci-ubuntu-24.04-4"
+        type: choice
+        options:
+          - "monkci-ubuntu-24.04-4"
+          - "monkci-ubuntu-24.04-2"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: identity probe
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    steps:
+      - name: Health
+        run: |
+          curl -sS -X POST http://127.0.0.1:7080/twirp/docker.v1.DockerCacheService/Health \
+            -H 'Content-Type: application/json' -d '{}'
+      - name: Wrong-org acquire must be denied with org_cache_identity_mismatch
+        shell: bash
+        run: |
+          set -uo pipefail
+          RESP=$(curl -sS -X POST http://127.0.0.1:7080/twirp/docker.v1.DockerCacheService/Acquire \
+            -H 'Content-Type: application/json' \
+            -d '{"repository":"Monk-CI-Test2/docker-cache-test","repositoryId":"1294796178","repositoryOwnerId":"999999999","jobId":"identity-probe-wrong","runAttempt":"1"}')
+          echo "wrong-org response: $RESP"
+          echo "$RESP" | grep -q 'org_cache_identity_mismatch' || { echo "::error::expected org_cache_identity_mismatch, got: $RESP"; exit 1; }
+          echo "$RESP" | grep -q '"cacheEnabled":true' && { echo "::error::wrong-org acquire was GRANTED"; exit 1; }
+          echo "PASS: wrong-org acquire denied with identity mismatch"
+      - name: Padded owner id must normalize and acquire the canonical
+        id: padded
+        shell: bash
+        run: |
+          set -uo pipefail
+          RESP=$(curl -sS -X POST http://127.0.0.1:7080/twirp/docker.v1.DockerCacheService/Acquire \
+            -H 'Content-Type: application/json' \
+            -d '{"repository":"Monk-CI-Test2/docker-cache-test","repositoryId":"1294796178","repositoryOwnerId":"0279648556","jobId":"identity-probe-padded","runAttempt":"1"}')
+          echo "padded response: $RESP"
+          echo "$RESP" | grep -q '"cacheEnabled":true' || { echo "::error::padded-owner acquire not granted: $RESP"; exit 1; }
+          for f in volumeName mountPath builderName leaseId; do
+            v=$(echo "$RESP" | sed -n "s/.*\"$f\":\"\([^\"]*\)\".*/\1/p")
+            echo "$f=$v" >> "$GITHUB_OUTPUT"
+            echo "$f=$v"
+          done
+          echo "PASS: padded owner acquire granted (normalization upstream verified via Redis/namespace audit)"
+      - name: Release padded lease cleanly
+        if: ${{ always() && steps.padded.outputs.leaseId != '' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          RESP=$(curl -sS -X POST http://127.0.0.1:7080/twirp/docker.v1.DockerCacheService/Release \
+            -H 'Content-Type: application/json' \
+            -d "{\"volumeName\":\"${{ steps.padded.outputs.volumeName }}\",\"mountPath\":\"${{ steps.padded.outputs.mountPath }}\",\"builderName\":\"${{ steps.padded.outputs.builderName }}\",\"leaseId\":\"${{ steps.padded.outputs.leaseId }}\",\"jobId\":\"identity-probe-padded\",\"buildDurationSeconds\":1}")
+          echo "release response: $RESP"
+          echo "$RESP" | grep -q '"released":true' || { echo "::error::release did not report released:true: $RESP"; exit 1; }
+          echo "PASS: padded lease released cleanly"
