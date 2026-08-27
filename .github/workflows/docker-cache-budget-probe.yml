@@ -1,0 +1,90 @@
+name: Docker Cache — GC budget & legacy-miglet compat probe
+
+# Calls the CONTROLLER's MigletService directly from a job VM (identity binding
+# passes: correct owner/repo for this VM's assigned job) to verify:
+#
+#   legacy    an acquire advertising clone+corruption but NOT repo_gc_budget_v1
+#             (i.e. a pre-budget miglet) must be denied with
+#             miglet_budget_capability_required (r12: capped leases only go to
+#             miglets that honor the cap; fallback is a local build).
+#   budget    a full-capability acquire must return repo_gc_budget_bytes equal
+#             to the org remainder (snapshot cap − other repos' bytes) with the
+#             4 GiB admission-reserve floor — the value the miglet writes into
+#             the per-lease buildkitd.toml keep-storage.
+#
+# The budget lease is released back (release_clean=true; the image was never
+# mounted, its on-disk clean marker is untouched).
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_budget_bytes:
+        description: "Expected repo_gc_budget_bytes for this acquire"
+        required: true
+        type: string
+      runner:
+        description: "Runner"
+        default: "monkci-ubuntu-24.04-4"
+        type: choice
+        options:
+          - "monkci-ubuntu-24.04-4"
+          - "monkci-ubuntu-24.04-2"
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: budget probe
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    steps:
+      - name: Resolve VM identity from GCE metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          MD="http://169.254.169.254/computeMetadata/v1/instance"
+          VM=$(curl -sf -H 'Metadata-Flavor: Google' "$MD/name")
+          CTRL=$(curl -sf -H 'Metadata-Flavor: Google' "$MD/attributes/controller-url")
+          echo "vm=$VM"; echo "ctrl=$CTRL"
+          echo "vm=$VM" >> "$GITHUB_OUTPUT"
+          echo "ctrl=$CTRL" >> "$GITHUB_OUTPUT"
+      - name: Legacy miglet (no repo_gc_budget_v1) must be denied
+        shell: bash
+        run: |
+          set -uo pipefail
+          RESP=$(curl -sS -X POST "${{ steps.meta.outputs.ctrl }}/twirp/miglet.v1.MigletService/AcquireCacheLease" \
+            -H 'Content-Type: application/json' \
+            -d '{"vm_id":"${{ steps.meta.outputs.vm }}","pool_id":"${{ inputs.runner }}","environment":"staging","repository":"Monk-CI-Test2/docker-cache-test","repository_id":"1294796178","repository_owner_id":"279648556","run_id":"90000000011","run_attempt":"1","access_mode":"CACHE_ACCESS_MODE_READ_WRITE","capabilities":["ceph_snapshot_clone_v1","ceph_canonical_corruption_v1"]}')
+          echo "legacy response: $RESP"
+          echo "$RESP" | grep -q 'miglet_budget_capability_required' || { echo "::error::expected miglet_budget_capability_required, got: $RESP"; exit 1; }
+          echo "$RESP" | grep -q '"cache_enabled":true' && { echo "::error::legacy miglet was GRANTED a capped lease"; exit 1; }
+          echo "PASS: pre-budget miglet denied (safe local fallback)"
+      - name: Full-capability acquire must carry the remainder/floor budget
+        id: budget
+        shell: bash
+        run: |
+          set -uo pipefail
+          RESP=$(curl -sS -X POST "${{ steps.meta.outputs.ctrl }}/twirp/miglet.v1.MigletService/AcquireCacheLease" \
+            -H 'Content-Type: application/json' \
+            -d '{"vm_id":"${{ steps.meta.outputs.vm }}","pool_id":"${{ inputs.runner }}","environment":"staging","repository":"Monk-CI-Test2/docker-cache-test","repository_id":"1294796178","repository_owner_id":"279648556","run_id":"90000000012","run_attempt":"1","access_mode":"CACHE_ACCESS_MODE_READ_WRITE","capabilities":["ceph_snapshot_clone_v1","ceph_canonical_corruption_v1","repo_gc_budget_v1"]}')
+          echo "budget response: $(echo "$RESP" | sed 's/"ceph_keyring":"[^"]*"/"ceph_keyring":"<redacted>"/; s/"ceph_conf":"[^"]*"/"ceph_conf":"<redacted>"/')"
+          echo "$RESP" | grep -q '"cache_enabled":true' || { echo "::error::full-capability acquire not granted: $RESP"; exit 1; }
+          LEASE=$(echo "$RESP" | sed -n 's/.*"lease_id":"\([^"]*\)".*/\1/p')
+          BUDGET=$(echo "$RESP" | sed -n 's/.*"repo_gc_budget_bytes":"\{0,1\}\([0-9]*\)"\{0,1\}.*/\1/p')
+          echo "lease_id=$LEASE" >> "$GITHUB_OUTPUT"
+          echo "lease=$LEASE budget=$BUDGET expected=${{ inputs.expected_budget_bytes }}"
+          [ "$BUDGET" = "${{ inputs.expected_budget_bytes }}" ] || { echo "::error::budget mismatch: got $BUDGET want ${{ inputs.expected_budget_bytes }}"; exit 1; }
+          echo "PASS: repo_gc_budget_bytes = $BUDGET"
+      - name: Release probe lease
+        if: ${{ always() && steps.budget.outputs.lease_id != '' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          RESP=$(curl -sS -X POST "${{ steps.meta.outputs.ctrl }}/twirp/miglet.v1.MigletService/ReleaseCacheLease" \
+            -H 'Content-Type: application/json' \
+            -d '{"vm_id":"${{ steps.meta.outputs.vm }}","pool_id":"${{ inputs.runner }}","environment":"staging","lease_id":"${{ steps.budget.outputs.lease_id }}","run_id":"90000000012","run_attempt":"1","release_clean":true,"cache_health":"CACHE_HEALTH_OK","cache_failure_reason":"CACHE_FAILURE_REASON_NONE"}')
+          echo "release response: $RESP"
+          echo "$RESP" | grep -q '"released":true' || { echo "::error::release failed: $RESP"; exit 1; }
+          echo "PASS: probe lease released"
