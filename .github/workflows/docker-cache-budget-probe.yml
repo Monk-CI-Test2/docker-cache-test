@@ -54,7 +54,7 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          RESP=$(curl -sS -X POST "${{ steps.meta.outputs.ctrl }}/twirp/miglet.v1.MigletService/AcquireCacheLease" \
+          RESP=$(curl -sS -X POST "${{ steps.meta.outputs.ctrl }}/twirp/monkci.miglet.v1.MigletService/AcquireCacheLease" \
             -H 'Content-Type: application/json' \
             -d '{"vm_id":"${{ steps.meta.outputs.vm }}","pool_id":"${{ inputs.runner }}","environment":"staging","repository":"Monk-CI-Test2/docker-cache-test","repository_id":"1294796178","repository_owner_id":"279648556","run_id":"90000000011","run_attempt":"1","access_mode":"CACHE_ACCESS_MODE_READ_WRITE","capabilities":["ceph_snapshot_clone_v1","ceph_canonical_corruption_v1"]}')
           echo "legacy response: $RESP"
@@ -66,7 +66,7 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          RESP=$(curl -sS -X POST "${{ steps.meta.outputs.ctrl }}/twirp/miglet.v1.MigletService/AcquireCacheLease" \
+          RESP=$(curl -sS -X POST "${{ steps.meta.outputs.ctrl }}/twirp/monkci.miglet.v1.MigletService/AcquireCacheLease" \
             -H 'Content-Type: application/json' \
             -d '{"vm_id":"${{ steps.meta.outputs.vm }}","pool_id":"${{ inputs.runner }}","environment":"staging","repository":"Monk-CI-Test2/docker-cache-test","repository_id":"1294796178","repository_owner_id":"279648556","run_id":"90000000012","run_attempt":"1","access_mode":"CACHE_ACCESS_MODE_READ_WRITE","capabilities":["ceph_snapshot_clone_v1","ceph_canonical_corruption_v1","repo_gc_budget_v1"]}')
           echo "budget response: $(echo "$RESP" | sed 's/"ceph_keyring":"[^"]*"/"ceph_keyring":"<redacted>"/; s/"ceph_conf":"[^"]*"/"ceph_conf":"<redacted>"/')"
@@ -82,7 +82,7 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          RESP=$(curl -sS -X POST "${{ steps.meta.outputs.ctrl }}/twirp/miglet.v1.MigletService/ReleaseCacheLease" \
+          RESP=$(curl -sS -X POST "${{ steps.meta.outputs.ctrl }}/twirp/monkci.miglet.v1.MigletService/ReleaseCacheLease" \
             -H 'Content-Type: application/json' \
             -d '{"vm_id":"${{ steps.meta.outputs.vm }}","pool_id":"${{ inputs.runner }}","environment":"staging","lease_id":"${{ steps.budget.outputs.lease_id }}","run_id":"90000000012","run_attempt":"1","release_clean":true,"cache_health":"CACHE_HEALTH_OK","cache_failure_reason":"CACHE_FAILURE_REASON_NONE"}')
           echo "release response: $RESP"
