@@ -1,0 +1,205 @@
+name: Docker Cache — Tiny Smoke (writer → parallel readers)
+
+# Minimal, FAST cache-correctness exercise (minutes, not tens of minutes):
+#
+#   writer    cold acquire (nofallback) -> tiny alpine build -> clean release
+#             (publishes the last-good snapshot)
+#   readers   3 parallel jobs acquire AFTER the writer released; each must get
+#             a builder (canonical/promoted writer or COW clone), report
+#             cache-hit and build mostly CACHED, fast.
+#   report    aggregates timings into the run summary.
+#
+# The build context is generated in-job (deterministic; no checkout needed).
+# `salt` busts every layer — change it to force a cold round.
+
+on:
+  workflow_dispatch:
+    inputs:
+      salt:
+        description: "Cache-bust salt (change to force a cold build)"
+        default: "v1"
+        type: string
+      runner:
+        description: "Runner"
+        default: "monkci-ubuntu-24.04-4"
+        type: choice
+        options:
+          - "monkci-ubuntu-24.04-4"
+          - "monkci-ubuntu-24.04-2"
+
+# No concurrency group: a wedged manual run must never block a fresh dispatch.
+permissions:
+  contents: read
+
+jobs:
+  writer:
+    name: 1 · writer (cold seed)
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    outputs:
+      w: ${{ steps.rec.outputs.w }}
+    steps:
+      - name: Generate tiny build context
+        env:
+          SALT: ${{ inputs.salt }}
+        run: |
+          mkdir -p ctx
+          cat > ctx/Dockerfile <<EOF
+          FROM alpine:3.20
+          RUN echo "salt=${SALT}" > /salt && sleep 5
+          RUN dd if=/dev/zero of=/blob1 bs=1M count=64 && sha256sum /blob1 /salt > /b1 && sleep 5
+          RUN dd if=/dev/zero of=/blob2 bs=1M count=64 && sha256sum /blob2 /b1 > /b2 && sleep 5
+          RUN apk add --no-cache curl && cat /salt
+          RUN echo done > /done
+          EOF
+      - name: Mark cache-setup start
+        run: date +%s%3N > /tmp/t_setup_start
+      - name: Set up Docker builder
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Mark cache-setup end
+        if: ${{ !cancelled() }}
+        run: date +%s%3N > /tmp/t_setup_end
+      - name: Build (cacheonly)
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${MONKCI_BUILDER:-}" ]] || { echo "::error::MONKCI_BUILDER not set — acquire failed"; exit 1; }
+          date +%s%3N > /tmp/t_build_start
+          docker buildx build --builder "$MONKCI_BUILDER" \
+            --output type=cacheonly --progress plain ctx 2>&1 | tee /tmp/build.log
+          date +%s%3N > /tmp/t_build_end
+      - name: Record result
+        id: rec
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          ROLE: writer
+          JOB_ID: writer
+          OUT_KEY: w
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          SETUP_OUTCOME: ${{ steps.builder.outcome }}
+          CACHE_HIT: ${{ steps.builder.outputs.cache-hit }}
+          MOUNT_PATH: ${{ steps.builder.outputs.mount-path }}
+        run: |
+          set -uo pipefail
+          ms() { cat "$1" 2>/dev/null || echo 0; }
+          SU_S=$(ms /tmp/t_setup_start); SU_E=$(ms /tmp/t_setup_end)
+          B_S=$(ms /tmp/t_build_start); B_E=$(ms /tmp/t_build_end)
+          setup_sec=$(awk -v a="$SU_S" -v b="$SU_E" 'BEGIN{ if(a>0&&b>=a) printf "%.1f",(b-a)/1000; else print "-" }')
+          build_sec=$(awk -v a="$B_S" -v b="$B_E" 'BEGIN{ if(a>0&&b>=a) printf "%.1f",(b-a)/1000; else print "-" }')
+          CACHED=$(grep -Eic '\bCACHED\b' /tmp/build.log 2>/dev/null | head -1); CACHED=${CACHED:-0}
+          GOT_CACHE=$([[ -n "${MONKCI_BUILDER:-}" ]] && echo true || echo false)
+          line="role=$ROLE job=$JOB_ID setup_outcome=${SETUP_OUTCOME:-unknown} build_outcome=${BUILD_OUTCOME:-unknown} got_cache=$GOT_CACHE cache_hit=${CACHE_HIT:-} cache_setup_sec=$setup_sec build_sec=$build_sec cached_steps=$CACHED mount=${MOUNT_PATH:-}"
+          echo "$line"
+          echo "$OUT_KEY=$line" >> "$GITHUB_OUTPUT"
+
+  readers:
+    name: 2 · reader-${{ matrix.job }}
+    needs: writer
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        job: [1, 2, 3]
+    outputs:
+      r1: ${{ steps.rec.outputs.r1 }}
+      r2: ${{ steps.rec.outputs.r2 }}
+      r3: ${{ steps.rec.outputs.r3 }}
+    steps:
+      - name: Generate tiny build context (identical to writer)
+        env:
+          SALT: ${{ inputs.salt }}
+        run: |
+          mkdir -p ctx
+          cat > ctx/Dockerfile <<EOF
+          FROM alpine:3.20
+          RUN echo "salt=${SALT}" > /salt && sleep 5
+          RUN dd if=/dev/zero of=/blob1 bs=1M count=64 && sha256sum /blob1 /salt > /b1 && sleep 5
+          RUN dd if=/dev/zero of=/blob2 bs=1M count=64 && sha256sum /blob2 /b1 > /b2 && sleep 5
+          RUN apk add --no-cache curl && cat /salt
+          RUN echo done > /done
+          EOF
+      - name: Mark cache-setup start
+        run: date +%s%3N > /tmp/t_setup_start
+      - name: Set up Docker builder
+        id: builder
+        uses: MonkCi-Inc/setup-docker-builder@v1
+        with:
+          nofallback: 'true'
+      - name: Mark cache-setup end
+        if: ${{ !cancelled() }}
+        run: date +%s%3N > /tmp/t_setup_end
+      - name: Build and assert CACHED
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${MONKCI_BUILDER:-}" ]] || { echo "::error::MONKCI_BUILDER not set — acquire failed"; exit 1; }
+          date +%s%3N > /tmp/t_build_start
+          docker buildx build --builder "$MONKCI_BUILDER" \
+            --output type=cacheonly --progress plain ctx 2>&1 | tee /tmp/build.log
+          date +%s%3N > /tmp/t_build_end
+          cached=$(grep -Eic '\bCACHED\b' /tmp/build.log || true)
+          [ "$cached" -ge 3 ] || { echo "::error::reader build had only $cached CACHED layers (expected >=3)"; exit 1; }
+      - name: Assert cache-hit
+        run: |
+          hit='${{ steps.builder.outputs.cache-hit }}'
+          [ "$hit" = "true" ] || { echo "::error::expected cache-hit=true after writer seed, got '$hit'"; exit 1; }
+      - name: Record result
+        id: rec
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          ROLE: reader
+          JOB_ID: ${{ matrix.job }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          SETUP_OUTCOME: ${{ steps.builder.outcome }}
+          CACHE_HIT: ${{ steps.builder.outputs.cache-hit }}
+          MOUNT_PATH: ${{ steps.builder.outputs.mount-path }}
+        run: |
+          set -uo pipefail
+          ms() { cat "$1" 2>/dev/null || echo 0; }
+          SU_S=$(ms /tmp/t_setup_start); SU_E=$(ms /tmp/t_setup_end)
+          B_S=$(ms /tmp/t_build_start); B_E=$(ms /tmp/t_build_end)
+          setup_sec=$(awk -v a="$SU_S" -v b="$SU_E" 'BEGIN{ if(a>0&&b>=a) printf "%.1f",(b-a)/1000; else print "-" }')
+          build_sec=$(awk -v a="$B_S" -v b="$B_E" 'BEGIN{ if(a>0&&b>=a) printf "%.1f",(b-a)/1000; else print "-" }')
+          CACHED=$(grep -Eic '\bCACHED\b' /tmp/build.log 2>/dev/null | head -1); CACHED=${CACHED:-0}
+          GOT_CACHE=$([[ -n "${MONKCI_BUILDER:-}" ]] && echo true || echo false)
+          line="role=$ROLE job=$JOB_ID setup_outcome=${SETUP_OUTCOME:-unknown} build_outcome=${BUILD_OUTCOME:-unknown} got_cache=$GOT_CACHE cache_hit=${CACHE_HIT:-} cache_setup_sec=$setup_sec build_sec=$build_sec cached_steps=$CACHED mount=${MOUNT_PATH:-}"
+          echo "$line"
+          echo "r$JOB_ID=$line" >> "$GITHUB_OUTPUT"
+
+  report:
+    name: 3 · report
+    needs: [writer, readers]
+    if: ${{ !cancelled() }}
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: Render run summary
+        shell: bash
+        env:
+          WRITER: ${{ needs.writer.outputs.w }}
+          FAN: ${{ toJSON(needs.readers.outputs) }}
+        run: |
+          set -uo pipefail
+          {
+            echo "## Tiny smoke — docker cache writer → 3 readers"
+            echo ""
+            echo "| job | role | got cache | cache hit | build | cache_setup (s) | build (s) | cached steps |"
+            echo "|---|---|---|---|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            role=""; job=""; got_cache=""; cache_hit=""; build_outcome=""
+            cache_setup_sec=""; build_sec=""; cached_steps=""
+            declare $line
+            echo "| $job | $role | $got_cache | ${cache_hit:--} | $build_outcome | $cache_setup_sec | $build_sec | $cached_steps |" >> "$GITHUB_STEP_SUMMARY"
+          done < <(printf '%s\n' "$WRITER"; jq -r 'to_entries | sort_by(.key | ltrimstr("r") | tonumber) | .[].value' <<<"$FAN")
+          echo "Report written to run summary."
