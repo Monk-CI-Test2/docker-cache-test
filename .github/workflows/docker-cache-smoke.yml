@@ -91,7 +91,7 @@ jobs:
           B_S=$(ms /tmp/t_build_start); B_E=$(ms /tmp/t_build_end)
           setup_sec=$(awk -v a="$SU_S" -v b="$SU_E" 'BEGIN{ if(a>0&&b>=a) printf "%.1f",(b-a)/1000; else print "-" }')
           build_sec=$(awk -v a="$B_S" -v b="$B_E" 'BEGIN{ if(a>0&&b>=a) printf "%.1f",(b-a)/1000; else print "-" }')
-          CACHED=$(grep -Eic '\bCACHED\b' /tmp/build.log 2>/dev/null | head -1); CACHED=${CACHED:-0}
+          CACHED=$(grep -Eic '\bCACHED\b' /tmp/build.log 2>/dev/null || true); CACHED=${CACHED:-0}
           GOT_CACHE=$([[ -n "${MONKCI_BUILDER:-}" ]] && echo true || echo false)
           line="role=$ROLE job=$JOB_ID setup_outcome=${SETUP_OUTCOME:-unknown} build_outcome=${BUILD_OUTCOME:-unknown} got_cache=$GOT_CACHE cache_hit=${CACHE_HIT:-} cache_setup_sec=$setup_sec build_sec=$build_sec cached_steps=$CACHED mount=${MOUNT_PATH:-}"
           echo "$line"
@@ -169,7 +169,7 @@ jobs:
           B_S=$(ms /tmp/t_build_start); B_E=$(ms /tmp/t_build_end)
           setup_sec=$(awk -v a="$SU_S" -v b="$SU_E" 'BEGIN{ if(a>0&&b>=a) printf "%.1f",(b-a)/1000; else print "-" }')
           build_sec=$(awk -v a="$B_S" -v b="$B_E" 'BEGIN{ if(a>0&&b>=a) printf "%.1f",(b-a)/1000; else print "-" }')
-          CACHED=$(grep -Eic '\bCACHED\b' /tmp/build.log 2>/dev/null | head -1); CACHED=${CACHED:-0}
+          CACHED=$(grep -Eic '\bCACHED\b' /tmp/build.log 2>/dev/null || true); CACHED=${CACHED:-0}
           GOT_CACHE=$([[ -n "${MONKCI_BUILDER:-}" ]] && echo true || echo false)
           line="role=$ROLE job=$JOB_ID setup_outcome=${SETUP_OUTCOME:-unknown} build_outcome=${BUILD_OUTCOME:-unknown} got_cache=$GOT_CACHE cache_hit=${CACHE_HIT:-} cache_setup_sec=$setup_sec build_sec=$build_sec cached_steps=$CACHED mount=${MOUNT_PATH:-}"
           echo "$line"
