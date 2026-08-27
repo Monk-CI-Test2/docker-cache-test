@@ -44,10 +44,10 @@ jobs:
           set -uo pipefail
           RESP=$(curl -sS -X POST http://127.0.0.1:7080/twirp/docker.v1.DockerCacheService/Acquire \
             -H 'Content-Type: application/json' \
-            -d '{"repository":"Monk-CI-Test2/docker-cache-test","repositoryId":"1294796178","repositoryOwnerId":"999999999","jobId":"identity-probe-wrong","runAttempt":"1"}')
+            -d '{"repository":"Monk-CI-Test2/docker-cache-test","repositoryId":"1294796178","repositoryOwnerId":"999999999","jobId":"90000000001","runId":"90000000001","runAttempt":"1"}')
           echo "wrong-org response: $RESP"
           echo "$RESP" | grep -q 'org_cache_identity_mismatch' || { echo "::error::expected org_cache_identity_mismatch, got: $RESP"; exit 1; }
-          echo "$RESP" | grep -q '"cacheEnabled":true' && { echo "::error::wrong-org acquire was GRANTED"; exit 1; }
+          echo "$RESP" | grep -q '"cache_enabled":true' && { echo "::error::wrong-org acquire was GRANTED"; exit 1; }
           echo "PASS: wrong-org acquire denied with identity mismatch"
       - name: Padded owner id must normalize and acquire the canonical
         id: padded
@@ -56,23 +56,23 @@ jobs:
           set -uo pipefail
           RESP=$(curl -sS -X POST http://127.0.0.1:7080/twirp/docker.v1.DockerCacheService/Acquire \
             -H 'Content-Type: application/json' \
-            -d '{"repository":"Monk-CI-Test2/docker-cache-test","repositoryId":"1294796178","repositoryOwnerId":"0279648556","jobId":"identity-probe-padded","runAttempt":"1"}')
+            -d '{"repository":"Monk-CI-Test2/docker-cache-test","repositoryId":"1294796178","repositoryOwnerId":"0279648556","jobId":"90000000002","runId":"90000000002","runAttempt":"1"}')
           echo "padded response: $RESP"
-          echo "$RESP" | grep -q '"cacheEnabled":true' || { echo "::error::padded-owner acquire not granted: $RESP"; exit 1; }
-          for f in volumeName mountPath builderName leaseId; do
+          echo "$RESP" | grep -q '"cache_enabled":true' || { echo "::error::padded-owner acquire not granted: $RESP"; exit 1; }
+          for f in volume_name mount_path builder_name lease_id; do
             v=$(echo "$RESP" | sed -n "s/.*\"$f\":\"\([^\"]*\)\".*/\1/p")
             echo "$f=$v" >> "$GITHUB_OUTPUT"
             echo "$f=$v"
           done
           echo "PASS: padded owner acquire granted (normalization upstream verified via Redis/namespace audit)"
       - name: Release padded lease cleanly
-        if: ${{ always() && steps.padded.outputs.leaseId != '' }}
+        if: ${{ always() && steps.padded.outputs.lease_id != '' }}
         shell: bash
         run: |
           set -uo pipefail
           RESP=$(curl -sS -X POST http://127.0.0.1:7080/twirp/docker.v1.DockerCacheService/Release \
             -H 'Content-Type: application/json' \
-            -d "{\"volumeName\":\"${{ steps.padded.outputs.volumeName }}\",\"mountPath\":\"${{ steps.padded.outputs.mountPath }}\",\"builderName\":\"${{ steps.padded.outputs.builderName }}\",\"leaseId\":\"${{ steps.padded.outputs.leaseId }}\",\"jobId\":\"identity-probe-padded\",\"buildDurationSeconds\":1}")
+            -d "{\"volumeName\":\"${{ steps.padded.outputs.volume_name }}\",\"mountPath\":\"${{ steps.padded.outputs.mount_path }}\",\"builderName\":\"${{ steps.padded.outputs.builder_name }}\",\"leaseId\":\"${{ steps.padded.outputs.lease_id }}\",\"jobId\":\"90000000002\",\"buildDurationSeconds\":1}")
           echo "release response: $RESP"
           echo "$RESP" | grep -q '"released":true' || { echo "::error::release did not report released:true: $RESP"; exit 1; }
           echo "PASS: padded lease released cleanly"
