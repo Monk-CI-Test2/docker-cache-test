@@ -1,0 +1,176 @@
+name: PostHog - 3x Parallel Cache Benchmark (staging)
+run-name: PostHog 3x / 4 vCPU / ${{ inputs.posthog_ref }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      posthog_ref:
+        description: PostHog ref resolved once for all seven builds
+        default: '05dbbbf21b24a01af49677bd5a4b6df2d1ed3002'
+        type: string
+      warmup:
+        description: Seed the persistent cache before the three warm jobs
+        default: true
+        type: boolean
+      github_usd_per_minute:
+        description: GitHub Linux x64 4-vCPU list rate (estimate)
+        default: '0.012'
+        type: string
+      monk_usd_per_minute:
+        description: Monk CI 4-vCPU usage rate
+        default: '0.008'
+        type: string
+      cache_usd_per_month:
+        description: Additional cache fee; 0 when 100 GB is included in plan
+        default: '0'
+        type: string
+      batches_per_month:
+        description: Three-job batches per month for amortizing cache fee
+        default: '1000'
+        type: string
+
+# Serializes this benchmark; do not run the other cache tests in this repo
+# concurrently, since they share its canonical cache.
+concurrency:
+  group: staging-posthog-cache-benchmark
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  CACHE_BUDGET_BYTES: '107374182400' # Product GB means GiB (100 * 2^30)
+
+jobs:
+  resolve:
+    name: resolve-posthog-sha
+    runs-on: monkci-ubuntu-24.04-4
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Resolve source and validate inputs
+        id: source
+        shell: bash
+        env:
+          POSTHOG_REF: ${{ inputs.posthog_ref }}
+          GH_RATE: ${{ inputs.github_usd_per_minute }}
+          MONK_RATE: ${{ inputs.monk_usd_per_minute }}
+          CACHE_FEE: ${{ inputs.cache_usd_per_month }}
+          BATCHES: ${{ inputs.batches_per_month }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = Monk-CI-Test2/docker-cache-test
+          python3 - <<'PY'
+          import math, os
+          for key in ('GH_RATE', 'MONK_RATE', 'CACHE_FEE', 'BATCHES'):
+              n = float(os.environ[key])
+              assert math.isfinite(n) and n >= 0, f'Invalid {key}'
+          assert float(os.environ['BATCHES']) > 0
+          assert float(os.environ['BATCHES']).is_integer()
+          PY
+          mkdir resolve-source
+          git -C resolve-source init -q
+          git -C resolve-source remote add origin https://github.com/PostHog/posthog.git
+          git -C resolve-source fetch --depth=1 -- origin "$POSTHOG_REF"
+          sha=$(git -C resolve-source rev-parse FETCH_HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "PostHog SHA: $sha; all builds use the full Dockerfile, linux/amd64, 4 vCPU."
+
+  uncached:
+    name: uncached-${{ matrix.leg }}
+    needs: resolve
+    runs-on: monkci-ubuntu-24.04-4
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        leg: [1, 2, 3]
+    outputs:
+      r1: ${{ steps.result.outputs.r1 }}
+      r2: ${{ steps.result.outputs.r2 }}
+      r3: ${{ steps.result.outputs.r3 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/posthog-benchmark
+        id: benchmark
+        with:
+          mode: uncached
+          sha: ${{ needs.resolve.outputs.sha }}
+      - name: Pass leg result to report
+        id: result
+        if: ${{ !cancelled() }}
+        env:
+          RESULT: ${{ steps.benchmark.outputs.result }}
+          LEG: ${{ matrix.leg }}
+        run: echo "r$LEG=$RESULT" >> "$GITHUB_OUTPUT"
+
+  warmup:
+    name: warmup-writer
+    needs: [resolve, uncached]
+    if: ${{ !cancelled() && inputs.warmup && needs.resolve.result == 'success' }}
+    runs-on: monkci-ubuntu-24.04-4
+    timeout-minutes: 180
+    outputs:
+      result: ${{ steps.benchmark.outputs.result }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/posthog-benchmark
+        id: benchmark
+        with:
+          mode: writer
+          sha: ${{ needs.resolve.outputs.sha }}
+
+  cached:
+    name: cached-${{ matrix.leg }}
+    needs: [resolve, uncached, warmup]
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && (needs.warmup.result == 'success' || (!inputs.warmup && needs.warmup.result == 'skipped')) }}
+    runs-on: monkci-ubuntu-24.04-4
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        leg: [1, 2, 3]
+    outputs:
+      r1: ${{ steps.result.outputs.r1 }}
+      r2: ${{ steps.result.outputs.r2 }}
+      r3: ${{ steps.result.outputs.r3 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/posthog-benchmark
+        id: benchmark
+        with:
+          mode: cached
+          sha: ${{ needs.resolve.outputs.sha }}
+      - name: Pass leg result to report
+        id: result
+        if: ${{ !cancelled() }}
+        env:
+          RESULT: ${{ steps.benchmark.outputs.result }}
+          LEG: ${{ matrix.leg }}
+        run: echo "r$LEG=$RESULT" >> "$GITHUB_OUTPUT"
+
+  report:
+    name: benchmark-report
+    needs: [resolve, uncached, warmup, cached]
+    if: ${{ !cancelled() }}
+    runs-on: monkci-ubuntu-24.04-4
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Print measured speedup and estimated costs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          POSTHOG_SHA: ${{ needs.resolve.outputs.sha }}
+          UNCACHED_RESULTS: ${{ toJSON(needs.uncached.outputs) }}
+          CACHED_RESULTS: ${{ toJSON(needs.cached.outputs) }}
+          WRITER_RESULT: ${{ needs.warmup.outputs.result }}
+          NEEDS: ${{ toJSON(needs) }}
+          GH_RATE: ${{ inputs.github_usd_per_minute }}
+          MONK_RATE: ${{ inputs.monk_usd_per_minute }}
+          CACHE_FEE: ${{ inputs.cache_usd_per_month }}
+          BATCHES: ${{ inputs.batches_per_month }}
+        run: python3 benchmark/report.py

@@ -1,0 +1,139 @@
+name: PostHog benchmark leg
+description: Identical 4-vCPU PostHog build with an empty local builder or Monk cache
+inputs:
+  mode:
+    description: uncached, writer, or cached
+    required: true
+  sha:
+    description: Resolved immutable PostHog commit
+    required: true
+outputs:
+  result:
+    description: JSON timings, cached steps, and cache bytes
+    value: ${{ steps.record.outputs.result }}
+runs:
+  using: composite
+  steps:
+    - name: Start measurement and check runner
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$RUNNER_TEMP/posthog-benchmark"
+        date +%s%3N > "$RUNNER_TEMP/posthog-benchmark/start"
+        test "$(nproc)" = 4
+        test "$(uname -m)" = x86_64
+        docker version
+        docker buildx version
+        free -h
+        df -h "$GITHUB_WORKSPACE"
+        if [[ "$MODE" != uncached && "$MODE" != writer && "$MODE" != cached ]]; then
+          echo '::error::Invalid benchmark mode'; exit 1
+        fi
+    - name: Fetch identical PostHog source
+      shell: bash
+      env:
+        POSTHOG_SHA: ${{ inputs.sha }}
+      run: |
+        set -euo pipefail
+        [[ "$POSTHOG_SHA" =~ ^[0-9a-f]{40}$ ]]
+        mkdir posthog
+        git -C posthog init -q
+        git -C posthog remote add origin https://github.com/PostHog/posthog.git
+        git -C posthog fetch --depth=1 origin "$POSTHOG_SHA"
+        git -C posthog checkout -q FETCH_HEAD
+        test "$(git -C posthog rev-parse HEAD)" = "$POSTHOG_SHA"
+    - name: Start builder setup timer
+      shell: bash
+      run: date +%s%3N > "$RUNNER_TEMP/posthog-benchmark/setup-start"
+    - name: Acquire persistent Monk CI builder
+      id: cache
+      if: ${{ inputs.mode != 'uncached' }}
+      uses: MonkCi-Inc/setup-docker-builder@d5c0a8b6a0e59a9662c899626b5653076748716c # v1, verified 2026-10-09
+      with:
+        nofallback: 'true'
+        buildkit-version: v0.28.0
+        platforms: linux/amd64
+    - name: Create empty local builder
+      if: ${{ inputs.mode == 'uncached' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        # A new docker-container volume per job; no cache-from/cache-to, and no
+        # --no-cache so PostHog's intra-build cache mounts retain normal behavior.
+        builder="posthog-empty-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        cat > "$RUNNER_TEMP/posthog-benchmark/buildkitd.toml" <<'EOF'
+        [worker.oci]
+          gc = true
+          gckeepstorage = 107374182400
+        [[worker.oci.gcpolicy]]
+          keepBytes = 107374182400
+          keepDuration = 604800
+          filters = ["type==regular"]
+        [[worker.oci.gcpolicy]]
+          all = true
+          keepBytes = 107374182400
+        EOF
+        docker buildx create --name "$builder" --driver docker-container \
+          --driver-opt image=moby/buildkit:v0.28.0 --platform linux/amd64 \
+          --buildkitd-config "$RUNNER_TEMP/posthog-benchmark/buildkitd.toml"
+        docker buildx inspect --builder "$builder" --bootstrap
+        echo "BENCHMARK_BUILDER=$builder" >> "$GITHUB_ENV"
+    - name: Finish builder setup timer
+      if: ${{ !cancelled() }}
+      shell: bash
+      run: date +%s%3N > "$RUNNER_TEMP/posthog-benchmark/setup-end"
+    - name: Build full PostHog Dockerfile
+      id: build
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        POSTHOG_SHA: ${{ inputs.sha }}
+        CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        CACHE_ROLE: ${{ steps.cache.outputs.cache-role }}
+      run: |
+        set -euo pipefail
+        if [[ "$MODE" == uncached ]]; then
+          builder="$BENCHMARK_BUILDER"
+        else
+          : "${MONKCI_BUILDER:?Monk cache builder missing}"
+          builder="$MONKCI_BUILDER"
+        fi
+        if [[ "$MODE" == writer && "$CACHE_ROLE" != canonical_writer ]]; then
+          echo '::error::Warmup needs the canonical writer to publish a snapshot'; exit 1
+        fi
+        if [[ "$MODE" == cached && "$CACHE_HIT" != true ]]; then
+          echo '::error::Warm benchmark requires cache-hit=true'; exit 1
+        fi
+        docker buildx inspect --builder "$builder"
+        date +%s%3N > "$RUNNER_TEMP/posthog-benchmark/build-start"
+        set +e
+        docker buildx build --builder "$builder" --platform linux/amd64 \
+          --progress=plain --build-arg "COMMIT_HASH=$POSTHOG_SHA" \
+          --file posthog/Dockerfile --output type=cacheonly posthog \
+          2>&1 | tee "$RUNNER_TEMP/posthog-benchmark/build.log"
+        status=${PIPESTATUS[0]}
+        set -e
+        date +%s%3N > "$RUNNER_TEMP/posthog-benchmark/build-end"
+        echo "build_exit_code=$status" >> "$GITHUB_OUTPUT"
+        exit "$status"
+    - name: Record timings, cached steps and cache size
+      id: record
+      if: ${{ !cancelled() }}
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        POSTHOG_SHA: ${{ inputs.sha }}
+        BUILD_OUTCOME: ${{ steps.build.outcome }}
+        CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        CACHE_ROLE: ${{ steps.cache.outputs.cache-role }}
+        CACHE_MOUNT: ${{ steps.cache.outputs.mount-path }}
+      run: python3 benchmark/record.py
+    - name: Remove local builder
+      if: ${{ always() && inputs.mode == 'uncached' }}
+      shell: bash
+      run: |
+        if [[ -n "${BENCHMARK_BUILDER:-}" ]]; then
+          docker buildx rm "$BENCHMARK_BUILDER"
+        fi

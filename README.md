@@ -31,6 +31,11 @@ per-repo canonical cache.
 
 ## PostHog parallel benchmarks
 
+For the **3 uncached vs 3 warm builds on identical 4-vCPU staging runners**, use
+`posthog-cache-benchmark.yml`. It prints cache size, cached steps, measured
+speedup and estimated GitHub/Monk costs, including seed and additional cache
+fees. [Setup and measurement details](benchmark/README.md).
+
 ## Run it
 Actions → **"PostHog Docker Cache - 20x Parallel"** → **Run workflow**.
 
