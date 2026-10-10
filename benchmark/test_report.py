@@ -24,7 +24,11 @@ def job(name, start, seconds, conclusion='success'):
 
 def result(mode, build_seconds=10):
     return dict(mode=mode, sha='a' * 40, cpu=4, arch='x86_64', valid=True,
-                errors=[], setup_sec=5, build_sec=build_seconds,
+                errors=[], setup_sec=5, build_sec=build_seconds, export_sec=2,
+                build_start_ms=1000, build_end_ms=1000 + build_seconds * 1000,
+                workload=dict(sha='a' * 40, dockerfile_sha256='b' * 64,
+                              platform='linux/amd64', buildkit='v0.28.0', output='oci,gzip'),
+                image=dict(valid=True, archive_bytes=2**30), initial_cache_records=0,
                 cache_hit=mode != 'uncached', cache_role='canonical_writer',
                 cached_steps=10 if mode != 'uncached' else 0,
                 executable_steps=10, cached_executable_steps=10 if mode != 'uncached' else 0,
@@ -88,6 +92,48 @@ class ReportTests(unittest.TestCase):
         self.assertFalse(valid)
         self.assertIn('cached-2: source or runner mismatch', summary)
 
+    def test_reused_uncached_step_withholds_claims(self):
+        values = json.loads(self.env['UNCACHED_RESULTS'])
+        bad = result('uncached', 500)
+        bad['cached_executable_steps'] = 1
+        values['r2'] = json.dumps(bad)
+        self.env['UNCACHED_RESULTS'] = json.dumps(values)
+        summary, valid = self.render()
+        self.assertFalse(valid)
+        self.assertIn('not a verified empty uncached build', summary)
+
+    def test_different_dockerfile_withholds_claims(self):
+        values = json.loads(self.env['CACHED_RESULTS'])
+        bad = result('cached')
+        bad['workload']['dockerfile_sha256'] = 'c' * 64
+        values['r2'] = json.dumps(bad)
+        self.env['CACHED_RESULTS'] = json.dumps(values)
+        summary, valid = self.render()
+        self.assertFalse(valid)
+        self.assertIn('Build workload differs', summary)
+
+    def test_missing_image_withholds_claims(self):
+        values = json.loads(self.env['CACHED_RESULTS'])
+        bad = result('cached')
+        bad['image'] = None
+        values['r2'] = json.dumps(bad)
+        self.env['CACHED_RESULTS'] = json.dumps(values)
+        summary, valid = self.render()
+        self.assertFalse(valid)
+        self.assertIn('final image was not verified', summary)
+
+    def test_serial_builds_on_overlapping_runners_withholds_claims(self):
+        values = {}
+        for i in (1, 2, 3):
+            r = result('cached')
+            r['build_start_ms'] = i * 100000
+            r['build_end_ms'] = r['build_start_ms'] + 10000
+            values[f'r{i}'] = json.dumps(r)
+        self.env['CACHED_RESULTS'] = json.dumps(values)
+        summary, valid = self.render()
+        self.assertFalse(valid)
+        self.assertIn('all three builds never overlapped', summary)
+
     def test_skipped_warmup_has_zero_seed_cost(self):
         self.jobs = [j for j in self.jobs if j['name'] != 'warmup-writer']
         self.env['WRITER_RESULT'] = ''
@@ -135,15 +181,19 @@ class ReportTests(unittest.TestCase):
                 (root / 'build.log').write_text('#1 [stage 1/1] RUN true\n#1 CACHED\n')
                 env = dict(RUNNER_TEMP=temp, MODE='cached', POSTHOG_SHA='a' * 40,
                            BUILD_OUTCOME='success', CACHE_HIT=hit, CACHE_MOUNT='/cache',
+                           IMAGE_OUTCOME='success',
                            MONKCI_BUILDER='test', CACHE_BUDGET_BYTES=str(100 * 2**30),
                            GITHUB_OUTPUT=str(Path(temp) / 'output'),
                            GITHUB_STEP_SUMMARY=str(Path(temp) / 'summary'))
                 df = subprocess.CompletedProcess([], 0, f'Size Used Avail\n{300 * 2**30} {used} 100000\n')
+                (root / 'workload.json').write_text(json.dumps(result('cached')['workload']))
+                (root / 'image.json').write_text(json.dumps(result('cached')['image']))
                 with patch.dict(os.environ, env), patch('record.subprocess.run', return_value=df):
                     self.assertEqual(record.main(), 1)
                 payload = json.loads((Path(temp) / 'output').read_text().split('=', 1)[1])
                 self.assertFalse(payload['valid'])
-                self.assertTrue(payload['errors'])
+                self.assertEqual(len(payload['errors']), 1)
+                self.assertIn('Warm leg' if hit == 'false' else 'exceeds', payload['errors'][0])
 
 
 if __name__ == '__main__':

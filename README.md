@@ -5,7 +5,8 @@ Parallel Docker cache test for the MonkCI Ceph RBD cache, using the (large) Post
 **All workflows are artifact-free.** Per-job results travel to the report jobs
 as GitHub job outputs (matrix legs each set their own `rN` output key), so no
 artifact storage is billed and a billing-blocked artifact upload can never fail
-a run or blank a report. Builds use `--output type=cacheonly` (nothing exported).
+a run or blank a report. The older 20x tests use `--output type=cacheonly`.
+The staging 3x benchmark exports and verifies a complete OCI image.
 
 ## Fault Matrix (bug hunting)
 

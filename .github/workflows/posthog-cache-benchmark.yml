@@ -6,7 +6,7 @@ on:
     inputs:
       posthog_ref:
         description: PostHog ref resolved once for all seven builds
-        default: '05dbbbf21b24a01af49677bd5a4b6df2d1ed3002'
+        default: '10f9ad720e7ac8ee16705bf60033f188aa987e7d' # Depot's October 8 benchmark revision
         type: string
       warmup:
         description: Seed the persistent cache before the three warm jobs
@@ -77,7 +77,7 @@ jobs:
           git -C resolve-source fetch --depth=1 -- origin "$POSTHOG_REF"
           sha=$(git -C resolve-source rev-parse FETCH_HEAD)
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "PostHog SHA: $sha; all builds use the full Dockerfile, linux/amd64, 4 vCPU."
+          echo "PostHog SHA: $sha; full Dockerfile and gzip OCI image export, linux/amd64, 4 vCPU."
 
   uncached:
     name: uncached-${{ matrix.leg }}
@@ -111,7 +111,7 @@ jobs:
   warmup:
     name: warmup-writer
     needs: [resolve, uncached]
-    if: ${{ !cancelled() && inputs.warmup && needs.resolve.result == 'success' }}
+    if: ${{ !cancelled() && inputs.warmup && needs.resolve.result == 'success' && needs.uncached.result == 'success' }}
     runs-on: monkci-ubuntu-24.04-4
     timeout-minutes: 180
     outputs:
@@ -127,7 +127,7 @@ jobs:
   cached:
     name: cached-${{ matrix.leg }}
     needs: [resolve, uncached, warmup]
-    if: ${{ !cancelled() && needs.resolve.result == 'success' && (needs.warmup.result == 'success' || (!inputs.warmup && needs.warmup.result == 'skipped')) }}
+    if: ${{ !cancelled() && needs.resolve.result == 'success' && needs.uncached.result == 'success' && (needs.warmup.result == 'success' || (!inputs.warmup && needs.warmup.result == 'skipped')) }}
     runs-on: monkci-ubuntu-24.04-4
     timeout-minutes: 180
     strategy:

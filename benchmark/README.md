@@ -6,12 +6,29 @@ Runs only on `Monk-CI-Test2/docker-cache-test`, the staging test organization.
 One dispatch runs **3 uncached PostHog builds in parallel → one cache writer →
 3 warm builds in parallel → report**. Every build uses `monkci-ubuntu-24.04-4`
 (4 vCPU, x64), the same resolved PostHog SHA, BuildKit v0.28.0 and the full
-unmodified PostHog Dockerfile. Output is `type=cacheonly`, as in the existing
-cache tests; image export/push is outside this measurement.
+unmodified PostHog Dockerfile. The default is the October 8, 2026 revision
+`10f9ad720e7ac8ee16705bf60033f188aa987e7d`, also used by the inspected
+[Depot benchmark](https://github.com/depot-demo-org/benchmark-posthog/actions/runs/37708336515).
+Every job exports a complete gzip-compressed OCI image to local disk. Build
+time includes image compression/export. The workflow verifies the manifest,
+config, platform, final PostHog command, layer count and every referenced blob's
+presence/size, then deletes the artifact. Registry push and external cache
+export are excluded. Depot's dual-platform build is a different workload;
+this test uses native amd64 on both sides.
+
+The previous June revision built in about six minutes with zero cached
+RUN/COPY/ADD steps, but measured only a cache solve, without an image export.
+Those durations describe that older workload and must not be reused for this
+new comparison. The October cache writer may still be slow on staging storage:
+the previous writer's Python environment COPY took 1,160.5 seconds, compared
+with 29.1 seconds on local disk. This workflow change does not repair Ceph.
 
 The three uncached jobs each start an empty local docker-container builder.
-There is no external cache import/export; cache mounts within a build retain
-normal behavior. Warm jobs require the persistent builder, `cache-hit=true`
+Before building, each must return **zero records** from `docker buildx du
+--format=json`. A fresh state volume clears dependency cache mounts as well
+as layer cache. Cold builds also pass `--no-cache`; any cached executable
+step invalidates the result. There is no external cache import/export;
+cache mounts within a build retain normal behavior. Warm jobs require the persistent builder, `cache-hit=true`
 and at least one cached executable step. The seed requires the canonical writer;
 its action post hook publishes the snapshot before the warm matrix starts.
 Older staging agents omit the optional `cache-role` output. In that case the
@@ -27,7 +44,9 @@ only when that PostHog SHA is already warm.
 Do not run other cache workflows in this repository during the benchmark.
 They share the repository's cache. The workflow serializes its own dispatches.
 `max-parallel: 3` requests parallelism; the report verifies that all three
-runners actually overlap. If staging capacity serializes them, it withholds
+runners and all three timed builds actually overlap. It also compares workload
+identities (source, Dockerfile SHA256, platform, BuildKit and export settings).
+If staging capacity serializes them, it withholds
 the headline instead of claiming a 3x parallel comparison.
 
 ## Capacity and 100 GB budget
@@ -40,7 +59,13 @@ builder uses a matching 100 GiB GC retention policy.
 
 The report prints cached-step counts, unique cached RUN/COPY/ADD counts,
 builder setup time, build time, full job time, and cache filesystem bytes/GiB.
-Each job also prints `docker buildx du --verbose` for logical cache usage.
+The writer also attempts `docker buildx du --verbose` for logical cache usage,
+with a 120-second deadline. Required results are saved first, and a timeout or
+command failure produces a warning instead of failing the build. The six
+comparison jobs skip this optional scan so its latency cannot distort their
+comparison. A missing required filesystem measurement still invalidates a leg,
+while preserving its diagnostic result. Image archive size and export time
+are shown separately from cache filesystem size.
 The filesystem usage is checked against the 100 GiB benchmark budget. It
 includes filesystem metadata; it is not the physical Ceph allocation.
 The thin image can show 300 GiB provisioned even with a 100 GiB entitlement.
@@ -64,7 +89,7 @@ kubectl --context gke_monkcidev_us-central1_monkci-non-prod-us-central1 \
 
 ## Cost and advertising claims
 
-Defaults verified on 2026-10-09: [GitHub Linux x64 4-core is $0.012/minute](https://docs.github.com/en/billing/reference/actions-runner-pricing)
+Defaults verified on 2026-10-11: [GitHub Linux x64 4-core is $0.012/minute](https://docs.github.com/en/billing/reference/actions-runner-pricing)
 and [Monk CI 4-vCPU is $0.008/minute](https://monkci.com/pricing).
 Override the inputs for a customer's contracted rates. GitHub is rounded up
 per job to whole minutes. Monk minutes are rounded to 0.01 per job, matching
@@ -79,7 +104,8 @@ The report uses the sum of three full job durations for cost and the earliest
 job start to latest job completion for parallel batch elapsed time. Full-job
 duration includes checkout, cache acquisition, source fetching, action post
 release and cleanup, using the current run attempt's GitHub jobs API. Queue
-time is excluded. A separate build-only median ratio is also printed.
+time is excluded. A separate median ratio for build plus complete image export
+is also printed. Export seconds are a subset of build seconds; do not add them.
 
 Seed cost is shown separately, along with the first cached batch including
 seed. Monthly projections include one seed plus the extra cache fee, allocated

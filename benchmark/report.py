@@ -75,9 +75,9 @@ def render(jobs):
     errors = []
     lines = [
         '# PostHog: 3 parallel builds, 4 vCPU each (staging)', '',
-        f"PostHog commit: `{os.environ['POSTHOG_SHA']}`. Full Dockerfile, linux/amd64, BuildKit v0.28.0.",
-        '', '| Job | Outcome | Cache hit / role | Setup s | Build s | Full job s | Cached steps (RUN/COPY/ADD) | Cache FS used GiB |',
-        '|---|---|---|---:|---:|---:|---:|---:|',
+        f"PostHog commit: `{os.environ['POSTHOG_SHA']}`. Full Dockerfile, linux/amd64, BuildKit v0.28.0; complete gzip OCI image export.",
+        '', '| Job | Outcome | Cache hit / role | Setup s | Build + export s | Export s (within build) | Full job s | Cached steps (RUN/COPY/ADD) | Cache FS used GiB | Image archive GiB |',
+        '|---|---|---|---:|---:|---:|---:|---:|---:|---:|',
     ]
     names = [f'uncached-{i}' for i in (1, 2, 3)]
     names += ['warmup-writer'] + [f'cached-{i}' for i in (1, 2, 3)]
@@ -93,13 +93,26 @@ def render(jobs):
             errors.append(f"{name}: {j['conclusion']}; {r.get('errors', [])}")
         if r['sha'] != os.environ['POSTHOG_SHA'] or r['cpu'] != 4 or r['arch'] != 'x86_64':
             errors.append(f'{name}: source or runner mismatch')
+        workload = r.get('workload')
+        if not workload or workload.get('sha') != os.environ['POSTHOG_SHA'] or workload.get('output') != 'oci,gzip':
+            errors.append(f'{name}: missing complete image-export workload identity')
+        image = r.get('image') or {}
+        if not image.get('valid'):
+            errors.append(f'{name}: final image was not verified')
+        if name.startswith('uncached-') and (r.get('initial_cache_records') != 0 or r['cached_executable_steps'] != 0):
+            errors.append(f'{name}: not a verified empty uncached build')
         seconds = job_seconds(j) if j.get('completed_at') else None
         used = r['cache_fs_used_bytes']
         size = f'{used / 2**30:.3f}' if used is not None else 'local'
         role_source = ' (volume)' if r.get('cache_role_source') == 'volume' else ''
+        image_size = f"{image['archive_bytes'] / 2**30:.3f}" if image.get('valid') else 'unverified'
         lines.append(f"| {name} | {j['conclusion']} | {r['cache_hit']} / {r['cache_role']}{role_source} | "
-                     f"{r['setup_sec']} | {r['build_sec']} | {seconds} | "
-                     f"{r['cached_steps']} ({r['cached_executable_steps']}/{r['executable_steps']}) | {size} |")
+                     f"{r['setup_sec']} | {r['build_sec']} | {r.get('export_sec')} | {seconds} | "
+                     f"{r['cached_steps']} ({r['cached_executable_steps']}/{r['executable_steps']}) | {size} | "
+                     f"{image_size} |")
+    identities = [r.get('workload') for r in results.values()]
+    if identities and any(w != identities[0] for w in identities):
+        errors.append('Build workload differs between jobs (Dockerfile, platform, BuildKit or exporter)')
     groups = {}
     for group in ('uncached', 'cached'):
         legs = [by_name.get(f'{group}-{i}') for i in (1, 2, 3)]
@@ -107,6 +120,13 @@ def render(jobs):
             groups[group] = batch_metrics(legs)
             if groups[group]['overlap'] <= 0:
                 errors.append(f'{group}: all three runners never overlapped; not a valid 3x parallel sample')
+            measurements = [results.get(f'{group}-{i}', {}) for i in (1, 2, 3)]
+            starts = [r.get('build_start_ms') for r in measurements]
+            ends = [r.get('build_end_ms') for r in measurements]
+            if any(t is None for t in starts + ends) or min(ends) <= max(starts):
+                errors.append(f'{group}: all three builds never overlapped or build timestamps are missing')
+            else:
+                groups[group]['build_overlap'] = (min(ends) - max(starts)) / 1000
     if errors:
         lines += ['', '**Incomplete or invalid benchmark: speedup and cost-saving claims withheld.**', '']
         lines += [f'- {e}' for e in errors]
@@ -126,13 +146,14 @@ def render(jobs):
         '', f'**Measured parallel batch speedup: {speedup:.2f}x** '
         f"({cold['span']:.1f}s uncached → {warm['span']:.1f}s warm; "
         f"{100 * (1 - warm['span'] / cold['span']):.1f}% less elapsed time).",
-        f'Build-only median speedup: {cold_build / warm_build:.2f}x '
+        f'Build + complete image export median speedup: {cold_build / warm_build:.2f}x '
         f'({cold_build:.3f}s → {warm_build:.3f}s).', '',
         '| Metric | Uncached 3x | Warm cache 3x |', '|---|---:|---:|',
         f"| Batch elapsed seconds | {cold['span']:.1f} | {warm['span']:.1f} |",
         f"| Median full-job seconds | {cold['median']:.1f} | {warm['median']:.1f} |",
         f"| Total runner minutes (sum of 3 jobs) | {cold['runner_minutes']:.3f} | {warm['runner_minutes']:.3f} |",
-        f"| All-three-runner overlap seconds | {cold['overlap']:.1f} | {warm['overlap']:.1f} |", '',
+        f"| All-three-runner overlap seconds | {cold['overlap']:.1f} | {warm['overlap']:.1f} |",
+        f"| All-three-build overlap seconds | {cold['build_overlap']:.1f} | {warm['build_overlap']:.1f} |", '',
         '| Cost scenario for one 3-job batch | Estimated USD |', '|---|---:|',
         f'| GitHub x64 4-vCPU uncached, projected from Monk uncached durations | ${gh_cold:.4f} |',
         f'| Monk CI 4-vCPU uncached | ${monk_cold:.4f} |',
@@ -148,13 +169,18 @@ def render(jobs):
         f'Rates: GitHub ${gh_rate}/minute (each job rounded up to a whole minute); '
         f'Monk ${monk_rate}/minute (elapsed minutes rounded to 0.01 per job). Additional cache ${cache_fee}/month.',
         '[GitHub rates](https://docs.github.com/en/billing/reference/actions-runner-pricing) · '
-        '[Monk CI rates](https://monkci.com/pricing), verified 2026-10-09.', '',
+        '[Monk CI rates](https://monkci.com/pricing), verified 2026-10-11.', '',
         'GitHub durations are **modeled**, not measured on GitHub hardware. Costs are usage-rate estimates, '
         'not invoices; included minutes, subscriptions and control/report jobs are excluded from the batch comparison.',
         'Full-job time comes from the GitHub jobs API and includes checkout, cache setup and action post/cleanup. '
         'Queue time is excluded. The warmup is separate and may itself hit an existing cache.',
-        'Cache FS used is the mounted filesystem view, including metadata; the workflow also prints '
-        '`docker buildx du --verbose`. The 100 GiB budget is an asserted benchmark limit. '
+        'All uncached jobs start with zero cache records, fresh RUN cache mounts, and --no-cache. '
+        'The six builds share an identical workload and verify a complete linux/amd64 PostHog OCI artifact. '
+        'Build time includes compression and image export; it excludes registry push and external cache export. '
+        'This is a native amd64 comparison, not Depot’s dual-platform benchmark. '
+        'Cache FS used is the mounted filesystem view, including metadata; only the writer attempts the optional '
+        '`docker buildx du --verbose` scan. Its timeout never invalidates successful measurements. '
+        'The 100 GiB budget is an asserted benchmark limit. '
         'Tenant entitlement is configured on the staging control plane, not through this workflow. '
         'The thin provisioned filesystem capacity may be 300 GiB. Ceph physical allocation must be checked with `rbd du`.',
     ]

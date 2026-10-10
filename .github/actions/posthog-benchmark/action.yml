@@ -28,6 +28,11 @@ runs:
         docker buildx version
         free -h
         df -h "$GITHUB_WORKSPACE"
+        # Leave room for BuildKit state plus a complete exported image.
+        available=$(df -B1 --output=avail "$RUNNER_TEMP" | tail -1)
+        if (( available < 60 * 1024 * 1024 * 1024 )); then
+          echo '::error::At least 60 GiB of local free disk is required'; exit 1
+        fi
         if [[ "$MODE" != uncached && "$MODE" != writer && "$MODE" != cached ]]; then
           echo '::error::Invalid benchmark mode'; exit 1
         fi
@@ -44,6 +49,16 @@ runs:
         git -C posthog fetch --depth=1 origin "$POSTHOG_SHA"
         git -C posthog checkout -q FETCH_HEAD
         test "$(git -C posthog rev-parse HEAD)" = "$POSTHOG_SHA"
+        python3 - <<'PY'
+        import hashlib, json, os
+        from pathlib import Path
+        workload = dict(sha=os.environ['POSTHOG_SHA'], platform='linux/amd64',
+                        dockerfile_sha256=hashlib.sha256(Path('posthog/Dockerfile').read_bytes()).hexdigest(),
+                        buildkit='v0.28.0', output='oci,gzip', provenance=False, sbom=False)
+        root = Path(os.environ['RUNNER_TEMP']) / 'posthog-benchmark'
+        (root / 'workload.json').write_text(json.dumps(workload))
+        print(json.dumps(workload, sort_keys=True))
+        PY
     - name: Start builder setup timer
       shell: bash
       run: date +%s%3N > "$RUNNER_TEMP/posthog-benchmark/setup-start"
@@ -60,9 +75,9 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        # A new docker-container volume per job; no cache-from/cache-to, and no
-        # --no-cache so PostHog's intra-build cache mounts retain normal behavior.
-        builder="posthog-empty-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+        # A fresh volume also empties RUN cache mounts, which --no-cache alone
+        # does not do. Never import a cache or reuse a previous builder.
+        builder="posthog-empty-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RANDOM}"
         cat > "$RUNNER_TEMP/posthog-benchmark/buildkitd.toml" <<'EOF'
         [worker.oci]
           gc = true
@@ -80,6 +95,13 @@ runs:
           --buildkitd-config "$RUNNER_TEMP/posthog-benchmark/buildkitd.toml"
         docker buildx inspect --builder "$builder" --bootstrap
         echo "BENCHMARK_BUILDER=$builder" >> "$GITHUB_ENV"
+        timeout --kill-after=10s 30s docker buildx du --builder "$builder" --format=json \
+          > "$RUNNER_TEMP/posthog-benchmark/cache-before.jsonl"
+        if [[ -s "$RUNNER_TEMP/posthog-benchmark/cache-before.jsonl" ]]; then
+          echo '::error::Uncached builder already contains cache records'; exit 1
+        fi
+        echo 'Verified empty builder: 0 cache records, fresh RUN cache mounts.'
+        echo 0 > "$RUNNER_TEMP/posthog-benchmark/initial-cache-records"
     - name: Finish builder setup timer
       if: ${{ !cancelled() }}
       shell: bash
@@ -103,22 +125,32 @@ runs:
         set -euo pipefail
         if [[ "$MODE" == uncached ]]; then
           builder="$BENCHMARK_BUILDER"
+          cache_args=(--no-cache)
         else
           : "${MONKCI_BUILDER:?Monk cache builder missing}"
           builder="$MONKCI_BUILDER"
+          cache_args=()
         fi
         docker buildx inspect --builder "$builder"
         date +%s%3N > "$RUNNER_TEMP/posthog-benchmark/build-start"
         set +e
-        docker buildx build --builder "$builder" --platform linux/amd64 \
+        docker buildx build --builder "$builder" --platform linux/amd64 --pull "${cache_args[@]}" \
           --progress=plain --build-arg "COMMIT_HASH=$POSTHOG_SHA" \
-          --file posthog/Dockerfile --output type=cacheonly posthog \
+          --provenance=false --sbom=false \
+          --metadata-file "$RUNNER_TEMP/posthog-benchmark/build-metadata.json" \
+          --file posthog/Dockerfile \
+          --output "type=oci,compression=gzip,dest=$RUNNER_TEMP/posthog-benchmark/image.oci.tar" posthog \
           2>&1 | tee "$RUNNER_TEMP/posthog-benchmark/build.log"
         status=${PIPESTATUS[0]}
         set -e
         date +%s%3N > "$RUNNER_TEMP/posthog-benchmark/build-end"
         echo "build_exit_code=$status" >> "$GITHUB_OUTPUT"
         exit "$status"
+    - name: Verify complete exported image
+      id: image
+      if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+      shell: bash
+      run: python3 benchmark/verify_image.py
     - name: Record timings, cached steps and cache size
       id: record
       if: ${{ !cancelled() }}
@@ -127,10 +159,15 @@ runs:
         MODE: ${{ inputs.mode }}
         POSTHOG_SHA: ${{ inputs.sha }}
         BUILD_OUTCOME: ${{ steps.build.outcome }}
+        IMAGE_OUTCOME: ${{ steps.image.outcome }}
         CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
         CACHE_ROLE: ${{ steps.cache.outputs.cache-role }}
         CACHE_MOUNT: ${{ steps.cache.outputs.mount-path }}
       run: python3 benchmark/record.py
+    - name: Remove exported image
+      if: ${{ always() }}
+      shell: bash
+      run: rm -f "$RUNNER_TEMP/posthog-benchmark/image.oci.tar"
     - name: Remove local builder
       if: ${{ always() && inputs.mode == 'uncached' }}
       shell: bash
