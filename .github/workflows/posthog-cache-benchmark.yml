@@ -41,6 +41,7 @@ permissions:
 
 env:
   CACHE_BUDGET_BYTES: '107374182400' # Product GB means GiB (100 * 2^30)
+  CANONICAL_CACHE_VOLUME: buildkit-cache # staging controller's canonical image
 
 jobs:
   resolve:

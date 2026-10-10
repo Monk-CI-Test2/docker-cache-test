@@ -14,6 +14,13 @@ There is no external cache import/export; cache mounts within a build retain
 normal behavior. Warm jobs require the persistent builder, `cache-hit=true`
 and at least one cached executable step. The seed requires the canonical writer;
 its action post hook publishes the snapshot before the warm matrix starts.
+Older staging agents omit the optional `cache-role` output. In that case the
+workflow verifies the role from the returned volume: `buildkit-cache` is the
+canonical image and `clone-<hex>` is a disposable reader. A clone is never
+accepted as a seed writer; conflicting roles and unknown volumes fail.
+The summary labels roles derived from the volume with `(volume)`.
+Local builder removal uses a three-minute timeout to allow deletion of the
+large state volume; full-job timings still include this cleanup.
 On later dispatches the seed may reuse an existing cache. Choose `warmup=false`
 only when that PostHog SHA is already warm.
 

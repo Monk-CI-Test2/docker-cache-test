@@ -84,14 +84,21 @@ runs:
       if: ${{ !cancelled() }}
       shell: bash
       run: date +%s%3N > "$RUNNER_TEMP/posthog-benchmark/setup-end"
+    - name: Verify persistent cache lease
+      if: ${{ inputs.mode != 'uncached' }}
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
+        CACHE_ROLE: ${{ steps.cache.outputs.cache-role }}
+        CACHE_VOLUME: ${{ steps.cache.outputs.volume-name }}
+      run: python3 benchmark/validate_cache.py
     - name: Build full PostHog Dockerfile
       id: build
       shell: bash
       env:
         MODE: ${{ inputs.mode }}
         POSTHOG_SHA: ${{ inputs.sha }}
-        CACHE_HIT: ${{ steps.cache.outputs.cache-hit }}
-        CACHE_ROLE: ${{ steps.cache.outputs.cache-role }}
       run: |
         set -euo pipefail
         if [[ "$MODE" == uncached ]]; then
@@ -99,12 +106,6 @@ runs:
         else
           : "${MONKCI_BUILDER:?Monk cache builder missing}"
           builder="$MONKCI_BUILDER"
-        fi
-        if [[ "$MODE" == writer && "$CACHE_ROLE" != canonical_writer ]]; then
-          echo '::error::Warmup needs the canonical writer to publish a snapshot'; exit 1
-        fi
-        if [[ "$MODE" == cached && "$CACHE_HIT" != true ]]; then
-          echo '::error::Warm benchmark requires cache-hit=true'; exit 1
         fi
         docker buildx inspect --builder "$builder"
         date +%s%3N > "$RUNNER_TEMP/posthog-benchmark/build-start"
@@ -135,5 +136,7 @@ runs:
       shell: bash
       run: |
         if [[ -n "${BENCHMARK_BUILDER:-}" ]]; then
-          docker buildx rm "$BENCHMARK_BUILDER"
+          # The PostHog state volume takes longer than Buildx's default 20s
+          # to delete. Extend its actual removal deadline and delete the state.
+          docker buildx rm --force --timeout 3m "$BENCHMARK_BUILDER"
         fi

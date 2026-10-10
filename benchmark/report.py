@@ -96,7 +96,8 @@ def render(jobs):
         seconds = job_seconds(j) if j.get('completed_at') else None
         used = r['cache_fs_used_bytes']
         size = f'{used / 2**30:.3f}' if used is not None else 'local'
-        lines.append(f"| {name} | {j['conclusion']} | {r['cache_hit']} / {r['cache_role']} | "
+        role_source = ' (volume)' if r.get('cache_role_source') == 'volume' else ''
+        lines.append(f"| {name} | {j['conclusion']} | {r['cache_hit']} / {r['cache_role']}{role_source} | "
                      f"{r['setup_sec']} | {r['build_sec']} | {seconds} | "
                      f"{r['cached_steps']} ({r['cached_executable_steps']}/{r['executable_steps']}) | {size} |")
     groups = {}

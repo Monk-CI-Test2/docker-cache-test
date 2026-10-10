@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import record
 import report
+import validate_cache
 
 
 def iso(seconds):
@@ -100,6 +101,28 @@ class ReportTests(unittest.TestCase):
         log += '#2 [stage 1/2] COPY package.json .\n#2 CACHED\n'
         log += '#3 [stage 2/2] RUN pnpm build\n#3 0.5 progress\n#3 DONE 1.0s\n'
         self.assertEqual(record.count_steps(log), (2, 1, 2))
+
+    def test_legacy_agent_canonical_volume_is_valid_writer(self):
+        self.assertEqual(validate_cache.validate('writer', '', 'buildkit-cache', 'false',
+                                                'buildkit-cache'), ('canonical_writer', 'volume'))
+
+    def test_legacy_agent_clone_cannot_seed_cache(self):
+        with self.assertRaisesRegex(ValueError, 'canonical writer'):
+            validate_cache.validate('writer', '', 'clone-abcdef', 'true', 'buildkit-cache')
+
+    def test_warm_clone_requires_real_hit(self):
+        self.assertEqual(validate_cache.validate('cached', '', 'clone-abcdef', 'true',
+                                                'buildkit-cache'), ('disposable_clone', 'volume'))
+        with self.assertRaisesRegex(ValueError, 'cache-hit=true'):
+            validate_cache.validate('cached', '', 'clone-abcdef', 'false', 'buildkit-cache')
+
+    def test_explicit_role_cannot_contradict_volume(self):
+        with self.assertRaisesRegex(ValueError, 'disagree'):
+            validate_cache.validate('writer', 'canonical_writer', 'clone-abcdef', 'true', 'buildkit-cache')
+
+    def test_unknown_volume_is_not_accepted_as_writer(self):
+        with self.assertRaisesRegex(ValueError, 'Unrecognized'):
+            validate_cache.validate('writer', '', 'local-fallback', 'true', 'buildkit-cache')
 
     def test_cache_budget_and_missed_warm_cache_fail_leg(self):
         for hit, used in (('false', 20 * 2**30), ('true', 101 * 2**30)):
